@@ -91,8 +91,8 @@ def ensure_coco_data(
 
     if not download:
         raise FileNotFoundError(
-            "COCO files not found. Provide --captions-json/--images-dir "
-            "or pass --download-coco with --coco-root."
+            "COCO files not found. Provide --captions-json/--images-dir, "
+            "or remove --no-download-coco to fetch under --coco-root."
         )
 
     coco_root.mkdir(parents=True, exist_ok=True)
@@ -450,9 +450,9 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--download-coco",
+        "--no-download-coco",
         action="store_true",
-        help="Download COCO 2014 annotations/images if local paths are missing.",
+        help="Do not download COCO; fail if captions/images are missing under --coco-root.",
     )
     parser.add_argument(
         "--coco-root",
@@ -545,7 +545,7 @@ def main() -> None:
             split=args.coco_split,
             captions_json=args.captions_json,
             images_dir=args.images_dir,
-            download=bool(args.download_coco),
+            download=not bool(args.no_download_coco),
         )
         print(f"[Benchmark] Captions: {captions_json}")
         print(f"[Benchmark] Images: {images_dir}")

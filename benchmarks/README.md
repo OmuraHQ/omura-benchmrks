@@ -17,8 +17,10 @@ uv run benchmark_omura_emmbed.py --rounds 5
 
 ```bash
 cd benchmarks
-uv run benchmark_coco_retrieval.py --download-coco --num-images 1000
+uv run benchmark_coco_retrieval.py --num-images 1000
 ```
+
+COCO val2014 annotations and images are downloaded under `data/coco/` when missing (use `--no-download-coco` to require pre-downloaded data).
 
 Paper-aligned Karpathy split protocol:
 

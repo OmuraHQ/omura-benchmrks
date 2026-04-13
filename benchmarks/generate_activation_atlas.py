@@ -33,7 +33,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate COCO embedding activation atlas chart")
     parser.add_argument("--coco-root", type=Path, default=DEFAULT_COCO_ROOT)
     parser.add_argument("--coco-split", type=str, default="val2014")
-    parser.add_argument("--download-coco", action="store_true")
+    parser.add_argument(
+        "--no-download-coco",
+        action="store_true",
+        help="Do not download COCO; fail if captions/images are missing.",
+    )
     parser.add_argument("--captions-json", type=Path, required=False)
     parser.add_argument("--images-dir", type=Path, required=False)
     parser.add_argument("--num-images", type=int, default=1000)
@@ -55,7 +59,7 @@ def main() -> None:
         split=args.coco_split,
         captions_json=args.captions_json,
         images_dir=args.images_dir,
-        download=bool(args.download_coco),
+        download=not bool(args.no_download_coco),
     )
     items = sample_items(load_coco_items(captions_json), args.num_images, args.seed)
 
