@@ -1,0 +1,24 @@
+# Reference copy of the query in omura.utils.blob_discovery._OBJECTS_QUERY
+#
+# Sui ObjectFilter (see https://docs.sui.io/references/sui-api/sui-graphql/beta/reference/types/inputs/object-filter)
+# only supports: type, owner, ownerKind, objectIds. There is NO filter for Walrus
+# storage.end_epoch or "active" blobs. Expired Blob objects remain in the result set;
+# Omura filters inactive rows in Python: _graphql_node_to_active_blob (end_epoch > epoch).
+
+query WalrusBlobObjectsByType($first: Int!, $after: String, $type: String!) {
+  objects(first: $first, after: $after, filter: { type: $type }) {
+    nodes {
+      address
+      version
+      asMoveObject {
+        contents {
+          json
+        }
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

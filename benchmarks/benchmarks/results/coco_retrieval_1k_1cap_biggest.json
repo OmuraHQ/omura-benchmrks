@@ -1,0 +1,10 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "num_images": 1000,
+  "num_captions": 1000,
+  "text_to_image": {
+    "R@1": 0.0,
+    "R@5": 0.008,
+    "R@10": 0.016
+  }
+}

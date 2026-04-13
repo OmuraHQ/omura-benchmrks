@@ -1,0 +1,36 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "protocol": "default",
+  "eval_mode": "global",
+  "candidate_pool_size": 10,
+  "num_images": 500,
+  "num_captions": 2500,
+  "text_normalization": "none",
+  "text_to_image": {
+    "R@1": 0.77,
+    "R@5": 0.952,
+    "R@10": 0.9756
+  },
+  "metric_context": {
+    "dataset": "MS COCO",
+    "split_type": "coco_annotations",
+    "split_name": "val2014",
+    "retrieval_mode": "global",
+    "candidate_universe": "full_split_global",
+    "protocol_locked": false,
+    "num_images_selected": 500,
+    "captions_per_image_limit": 5,
+    "text_normalization": "none"
+  },
+  "image_to_text": {
+    "R@1": 0.896,
+    "R@5": 0.984,
+    "R@10": 0.998
+  },
+  "sanity_check": {
+    "n_samples": 256,
+    "mean_pos_cosine": 0.14962372979789507,
+    "mean_neg_cosine": -0.05267656037904089,
+    "mean_gap_pos_minus_neg": 0.20230029017693596
+  }
+}

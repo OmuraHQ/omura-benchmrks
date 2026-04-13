@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Data directories
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Logs
+*.log
+logs/
+
+# UV
+uv.lock
+
+# Model cache
+*.pth
+*.pt
+*.ckpt
+imagebind_cache/
+
+# Vector indices
+vector_index/
+*.index
+
+# Metadata
+metadata/
+blob_ids.json
+
+# Notebook / editor artifacts
+.ipynb_checkpoints/
+.checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Optional local planning/docs (not required for runtime)
+docs/REVENUE_MODEL.md
+docs/TECHNICAL_ARCHITECTURE.md
+docs/USAGE.md
