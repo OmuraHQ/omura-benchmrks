@@ -62,10 +62,10 @@ Key configuration variables:
 
 ### Use your Hugging Face Omura Embed model
 
-If you duplicated/renamed your model repo on Hugging Face (for example `immortaltatsu/omura_emmbed`), set:
+If you duplicated/renamed your model repo on Hugging Face (for example `immortaltatsu/omura_emebd`), set:
 
 ```bash
-export OMURA_EMBEDDING_MODEL="immortaltatsu/omura_emmbed"
+export OMURA_EMBEDDING_MODEL="immortaltatsu/omura_emebd"
 ```
 
 Omura will load this model via `transformers` at runtime.
@@ -81,7 +81,7 @@ python -m omura.main
 Or run with your custom Hugging Face model directly:
 
 ```bash
-OMURA_EMBEDDING_MODEL="immortaltatsu/omura_emmbed" python -m omura.main
+OMURA_EMBEDDING_MODEL="immortaltatsu/omura_emebd" python -m omura.main
 ```
 
 ### CLI commands:
@@ -110,13 +110,13 @@ omura export
 Use the benchmark script to validate latency/throughput and a retrieval sanity check:
 
 ```bash
-PYTHONPATH=. python benchmarks/benchmark_omura_emmbed.py --model "immortaltatsu/omura_emmbed"
+PYTHONPATH=. python benchmarks/benchmark_omura_emmbed.py --model "immortaltatsu/omura_emebd"
 ```
 
 Optional image benchmark:
 
 ```bash
-PYTHONPATH=. python benchmarks/benchmark_omura_emmbed.py --model "immortaltatsu/omura_emmbed" --image-dir data/samples --max-images 100
+PYTHONPATH=. python benchmarks/benchmark_omura_emmbed.py --model "immortaltatsu/omura_emebd" --image-dir data/samples --max-images 100
 ```
 
 Results are saved to `benchmarks/results/omura_emmbed_benchmark.json`.

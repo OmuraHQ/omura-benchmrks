@@ -1,0 +1,36 @@
+{
+  "model": "immortaltatsu/omura_emebd",
+  "protocol": "default",
+  "eval_mode": "global",
+  "candidate_pool_size": 10,
+  "num_images": 100,
+  "num_captions": 500,
+  "text_normalization": "none",
+  "text_to_image": {
+    "R@1": 0.926,
+    "R@5": 0.988,
+    "R@10": 0.988
+  },
+  "metric_context": {
+    "dataset": "MS COCO",
+    "split_type": "coco_annotations",
+    "split_name": "val2014",
+    "retrieval_mode": "global",
+    "candidate_universe": "full_split_global",
+    "protocol_locked": false,
+    "num_images_selected": 100,
+    "captions_per_image_limit": 5,
+    "text_normalization": "none"
+  },
+  "image_to_text": {
+    "R@1": 0.99,
+    "R@5": 1.0,
+    "R@10": 1.0
+  },
+  "sanity_check": {
+    "n_samples": 64,
+    "mean_pos_cosine": 0.15812003624159843,
+    "mean_neg_cosine": -0.02051875929464586,
+    "mean_gap_pos_minus_neg": 0.1786387955362443
+  }
+}

@@ -38,7 +38,7 @@ logging.getLogger().addFilter(_log_filter)
 logging.getLogger("transformers").addFilter(_log_filter)
 logging.getLogger("transformers.modeling_rope_utils").addFilter(_log_filter)
 
-MODEL_NAME = os.getenv("OMURA_EMBEDDING_MODEL", "immortaltatsu/omura_emmbed")
+MODEL_NAME = os.getenv("OMURA_EMBEDDING_MODEL", "immortaltatsu/omura_emebd")
 
 # Pool of (model, processor, device) tuples — one entry per GPU.
 # Workers get() a slot, run inference, put() it back.
@@ -199,7 +199,10 @@ def _is_omura_emmbed_model() -> bool:
     if backend in {"omura_emmbed", "omura_emmbed_v1"}:
         return True
     name = MODEL_NAME.lower()
-    return ("omura_emmbed" in name) and "jina" not in name
+    if "jina" in name:
+        return False
+    # HF repo id is `omura_emebd`; older docs used `omura_emmbed` (typo).
+    return ("omura_emebd" in name) or ("omura_emmbed" in name)
 
 
 def _is_jina_clip_model() -> bool:

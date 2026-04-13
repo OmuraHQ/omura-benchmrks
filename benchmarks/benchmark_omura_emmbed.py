@@ -7,8 +7,8 @@ This script measures:
 4) tiny text-retrieval quality sanity check (Recall@1)
 
 Usage examples:
-  OMURA_EMBEDDING_MODEL="<user>/omura_emmbed" uv run python benchmarks/benchmark_omura_emmbed.py
-  uv run python benchmarks/benchmark_omura_emmbed.py --model "<user>/omura_emmbed" --image-dir data/samples
+  OMURA_EMBEDDING_MODEL="<user>/omura_emebd" uv run python benchmarks/benchmark_omura_emmbed.py
+  uv run python benchmarks/benchmark_omura_emmbed.py --model "<user>/omura_emebd" --image-dir data/samples
 """
 
 from __future__ import annotations
