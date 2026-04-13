@@ -1,0 +1,30 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "protocol": "siglip2_paper_val",
+  "eval_mode": "global",
+  "candidate_pool_size": 1000,
+  "num_images": 5000,
+  "num_captions": 25000,
+  "text_normalization": "none",
+  "text_to_image": {
+    "R@1": 0.00028,
+    "R@5": 0.00104,
+    "R@10": 0.00256
+  },
+  "metric_context": {
+    "dataset": "MS COCO",
+    "split_type": "karpathy",
+    "split_name": "val",
+    "retrieval_mode": "global",
+    "candidate_universe": "full_split_global",
+    "protocol_locked": true,
+    "num_images_selected": 5000,
+    "captions_per_image_limit": 5,
+    "text_normalization": "none"
+  },
+  "image_to_text": {
+    "R@1": 0.001,
+    "R@5": 0.0026,
+    "R@10": 0.0038
+  }
+}

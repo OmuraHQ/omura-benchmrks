@@ -1,0 +1,16 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "protocol": "default",
+  "eval_mode": "local_negatives",
+  "candidate_pool_size": 10,
+  "num_images": 1000,
+  "num_captions": 1000,
+  "text_to_image": {
+    "R@1": 0.091,
+    "R@5": 0.492,
+    "R@10": 1.0
+  },
+  "warnings": [
+    "local_negatives with candidate_pool_size<=10 makes R@10 trivial (can saturate at ~1.0). Prefer pool>=50 for meaningful R@10."
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "model": "immortaltatsu/omura_emebd",
+  "init_seconds": 8.346032751724124,
+  "text_benchmark": {
+    "calls": 75,
+    "elapsed_seconds": 0.7221073359251022,
+    "items_per_second": 103.86267562829342,
+    "avg_ms_per_item": 9.628097812334696,
+    "vectors_collected": 75
+  },
+  "retrieval_sanity": {
+    "queries": 5,
+    "docs": 10,
+    "recall_at_1": 0.6,
+    "recall_at_5": 0.8,
+    "recall_at_10": 1.0
+  }
+}

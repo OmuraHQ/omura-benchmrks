@@ -1,0 +1,10 @@
+{
+  "model": "immortaltatsu/omura_emebd",
+  "num_points": 1000,
+  "embedding_dim": 768,
+  "pc1_mean": 9.775162013170302e-09,
+  "pc1_std": 0.15913687646389008,
+  "pc2_mean": -1.3470649484759178e-08,
+  "pc2_std": 0.14048178493976593,
+  "png": "benchmarks/results/coco_activation_atlas_1k.png"
+}

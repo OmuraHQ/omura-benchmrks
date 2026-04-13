@@ -1,0 +1,10 @@
+{
+  "model": "google/siglip2-base-patch16-224",
+  "num_images": 200,
+  "num_captions": 1000,
+  "text_to_image": {
+    "R@1": 0.031,
+    "R@5": 0.081,
+    "R@10": 0.135
+  }
+}

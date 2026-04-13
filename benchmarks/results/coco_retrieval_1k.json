@@ -1,0 +1,10 @@
+{
+  "model": "immortaltatsu/omura_emebd",
+  "num_images": 1000,
+  "num_captions": 5000,
+  "text_to_image": {
+    "R@1": 0.0036,
+    "R@5": 0.0212,
+    "R@10": 0.0368
+  }
+}
