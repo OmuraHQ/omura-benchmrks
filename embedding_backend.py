@@ -11,7 +11,7 @@ from PIL import Image
 from transformers import AutoModel, AutoProcessor
 
 MODEL_NAME = os.getenv(
-    "OMURA_EMBEDDING_MODEL", "google/siglip2-so400m-patch14-384"
+    "OMURA_EMBEDDING_MODEL", "immortaltatsu/omura_emebd"
 )
 
 _MODEL = None
