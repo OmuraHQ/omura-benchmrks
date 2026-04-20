@@ -103,7 +103,9 @@ omura export
 - `GET /blobs/{blob_id}` - Get blob metadata
 - `GET /blobs/{blob_id}/urls` - Get frontend-usable URLs
 - `POST /search` - Vector similarity search
+- `POST /search/image` - Image-to-image and text-to-image search
 - `GET /stats` - Indexing statistics
+- `GET /health` - Health check and readiness probe
 
 ## Benchmark your model
 
