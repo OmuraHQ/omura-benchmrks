@@ -21,10 +21,5 @@
     "num_images_selected": 1000,
     "captions_per_image_limit": 5,
     "text_normalization": "none"
-  },
-  "image_to_text": {
-    "R@1": 0.83,
-    "R@5": 0.953,
-    "R@10": 0.98
   }
 }
