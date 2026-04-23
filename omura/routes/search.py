@@ -546,7 +546,7 @@ async def media_counters_dashboard() -> MediaBlobCounterResponse:
     ),
 )
 async def classifier_counts_dashboard() -> ClassifierDashboardResponse:
-    # DB is authoritative for dashboard counters (works even on API-only nodes).
+    # DB is authoritative for NSFW counter baseline (works even on API-only nodes).
     db_nsfw_count = 0
     try:
         with sqlite3.connect(str(CATALOG_DB_PATH), timeout=10) as conn:
@@ -557,163 +557,87 @@ async def classifier_counts_dashboard() -> ClassifierDashboardResponse:
     except Exception:
         db_nsfw_count = 0
 
-    # Keep in-memory count as secondary signal and use the larger value to avoid stale-underflow.
-    mem_nsfw_count = 0
-    semantic_counts: Dict[str, int] = {}
+    requested_buckets = ["nsfw", "screen_ui", "building", "art", "animal", "food"]
+    categories_out: Dict[str, int] = {k: 0 for k in requested_buckets}
+    categories_out["other"] = 0
+
     store: Optional[VectorStore] = None
     try:
         store = get_vector_store()
-        for _, raw in store.metadata.items():
-            try:
-                meta = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                if meta.get("is_nsfw"):
-                    mem_nsfw_count += 1
-                # Aggregate semantic categories if present.
-                for cat in (meta.get("categories") or []):
-                    if isinstance(cat, str) and cat.strip():
-                        semantic_counts[cat] = semantic_counts.get(cat, 0) + 1
-            except Exception:
-                continue
     except HTTPException:
-        pass
+        store = None
 
-    # Preferred path: precomputed atlas projection (stable, matches offline analysis).
-    computed_counts: Dict[str, int] = {}
-    projection_total_images: Optional[int] = None
-    proj = _load_dashboard_projection_counts()
-    if proj is not None:
-        computed_counts, projection_total_images = proj
-        mem_nsfw_count = max(mem_nsfw_count, int(computed_counts.get("nsfw", 0)))
-
-    # Else: compute dashboard buckets from current embeddings + atlas labels.
-    if not computed_counts and store is not None and len(store.embeddings_dict) > 0:
+    live_nsfw_count = 0
+    if store is not None and len(store.embeddings_dict) > 0:
         try:
-            from omura.utils.imagebind_embeddings import generate_text_embedding
+            from omura.utils.imagebind_embeddings import get_semantic_category_embeddings
 
-            atlas_path = Path(
-                os.getenv(
-                    "OMURA_DASHBOARD_ATLAS_PATH",
-                    "data/atlas/omura_emmbed_11_categories_atlas.json",
-                )
-            )
-            if not atlas_path.exists():
-                raise RuntimeError(f"Atlas file not found: {atlas_path}")
+            semantic_labels = [
+                "screen_ui",
+                "building",
+                "art",
+                "animal",
+                "food",
+                "human",
+                "nature",
+                "vehicle",
+                "document",
+                "meme",
+            ]
+            semantic_embs = get_semantic_category_embeddings(semantic_labels)
+            nsfw_vecs = get_nsfw_embeddings() or []
 
-            global _atlas_anchor_cache
-            atlas_texts: list[str] = []
-            atlas_embs: list[np.ndarray] = []
-            atlas_mtime = str(atlas_path.stat().st_mtime_ns)
-            if (
-                _atlas_anchor_cache is not None
-                and _atlas_anchor_cache[0] == atlas_mtime
-            ):
-                atlas_texts = list(_atlas_anchor_cache[1])
-                C = np.asarray(_atlas_anchor_cache[2], dtype=np.float32)
-            else:
-                atlas_obj = json.loads(atlas_path.read_text(encoding="utf-8"))
-                points = atlas_obj.get("points", [])
-                for p in points:
-                    txt = str(p.get("text") or "").strip()
-                    if txt:
-                        atlas_texts.append(txt)
-                # Keep unique order
-                seen = set()
-                atlas_texts = [t for t in atlas_texts if not (t in seen or seen.add(t))]
-                if not atlas_texts:
-                    raise RuntimeError("Atlas points missing `text` labels.")
-
-                for label in atlas_texts:
-                    emb = generate_text_embedding(label, is_document=False)
-                    if emb is None:
-                        continue
-                    v = np.asarray(emb, dtype=np.float32).flatten()
-                    n = np.linalg.norm(v)
-                    if n > 0:
-                        v = v / n
-                    atlas_embs.append(v)
-                if len(atlas_embs) != len(atlas_texts):
-                    raise RuntimeError("Failed to embed all atlas labels.")
-                C = np.stack(atlas_embs, axis=0).astype(np.float32)
-                _atlas_anchor_cache = (atlas_mtime, list(atlas_texts), C.copy())
-
-            if len(atlas_texts) == int(C.shape[0]) and int(C.shape[0]) > 0:
-                image_ids: List[str] = []
-                image_vecs: List[np.ndarray] = []
-                for blob_id, emb in store.embeddings_dict.items():
-                    meta = store.get_blob_metadata(blob_id) or {}
+            for blob_id, raw in store.metadata.items():
+                try:
+                    meta = json.loads(raw) if isinstance(raw, str) else dict(raw)
                     if _normalize_kind(meta.get("kind")) != "image":
                         continue
+
+                    emb = store.get_embedding(blob_id)
+                    if emb is None:
+                        continue
+
                     vec = np.asarray(emb, dtype=np.float32).flatten()
                     n = np.linalg.norm(vec)
                     if n > 0:
                         vec = vec / n
-                    image_ids.append(blob_id)
-                    image_vecs.append(vec)
 
-                if image_vecs:
-                    X = np.stack(image_vecs, axis=0)
-                    D = np.linalg.norm(X[:, None, :] - C[None, :, :], axis=2)
+                    # Prioritize hybrid NSFW assignment.
+                    tag_s = float(nsfw_similarity_score_0_100(vec, nsfw_vecs))
+                    if is_nsfw_from_tag_score(tag_s):
+                        categories_out["nsfw"] += 1
+                        live_nsfw_count += 1
+                        continue
 
-                    best_idx = D.argmin(axis=1)
-                    # Projection-accurate category counts:
-                    # one nearest class per image, no extra NSFW gate.
-                    for cat in atlas_texts:
-                        computed_counts[cat] = 0
-                    for i in range(len(X)):
-                        cat = atlas_texts[int(best_idx[i])]
-                        computed_counts[cat] += 1
-                    mem_nsfw_count = max(mem_nsfw_count, int(computed_counts.get("nsfw", 0)))
+                    if semantic_embs:
+                        scores = [float(np.dot(vec, cat_emb)) for cat_emb in semantic_embs]
+                        best_idx = int(np.argmax(np.asarray(scores, dtype=np.float32)))
+                        best_label = semantic_labels[best_idx]
+                        if best_label in categories_out:
+                            categories_out[best_label] += 1
+                        else:
+                            categories_out["other"] += 1
+                    else:
+                        categories_out["other"] += 1
+                except Exception:
+                    continue
         except Exception as e:
-            print(f"[Search] classifier dashboard compute fallback: {e}")
+            print(f"[Search] classifier dashboard live classification failed: {e}")
 
-    # Fallback category buckets from DB indexed modality counts if semantic labels are absent.
-    fallback_counts: Dict[str, int] = {}
-    try:
-        epoch = get_current_epoch(silent=True)
-        current_epoch = MANUAL_EPOCH if epoch is None else int(epoch)
-    except Exception:
-        current_epoch = MANUAL_EPOCH
-    try:
-        if CATALOG_DB_PATH.exists():
-            db_idx = _sql_indexed_counts(str(CATALOG_DB_PATH), current_epoch)
-            by_kind = db_idx.get("by_kind", {})
-            fallback_counts = {str(k): int(v) for k, v in by_kind.items()}
-    except Exception:
-        fallback_counts = {}
-
-    # Dashboard contract: expose only requested buckets + "other".
-    requested_buckets = ["nsfw", "screen_ui", "building", "art", "animal", "food"]
-
-    if computed_counts:
-        categories_out = {k: int(computed_counts.get(k, 0)) for k in requested_buckets}
-        if projection_total_images is not None:
-            used = sum(int(v) for v in categories_out.values())
-            categories_out["other"] = max(0, int(projection_total_images - used))
-        else:
-            # Live NN path: approximate total from embedding rows (includes non-image rows).
-            total_images = 0
-            try:
-                for _, emb in store.embeddings_dict.items() if store is not None else []:
-                    total_images += 1
-            except Exception:
-                total_images = sum(int(v) for v in categories_out.values())
-            used = sum(int(v) for v in categories_out.values())
-            categories_out["other"] = max(0, int(total_images - used))
-    elif semantic_counts:
-        categories_out = {k: int(semantic_counts.get(k, 0)) for k in requested_buckets}
-        used = sum(int(v) for v in categories_out.values())
-        # If semantic metadata exists but does not fully cover images, keep residual in "other".
-        total_images = int(fallback_counts.get("image", used))
-        categories_out["other"] = max(0, total_images - used)
-    else:
-        # Fallback with no semantic metadata: map by modality and keep rest in "other".
-        categories_out = {k: 0 for k in requested_buckets}
-        total_images = int(fallback_counts.get("image", 0))
-        categories_out["other"] = total_images
+    if sum(int(v) for v in categories_out.values()) == 0:
+        # Last-resort fallback with no live store data.
+        try:
+            epoch = get_current_epoch(silent=True)
+            current_epoch = MANUAL_EPOCH if epoch is None else int(epoch)
+            if CATALOG_DB_PATH.exists():
+                db_idx = _sql_indexed_counts(str(CATALOG_DB_PATH), current_epoch)
+                categories_out["other"] = int(db_idx.get("by_kind", {}).get("image", 0))
+        except Exception:
+            pass
 
     return ClassifierDashboardResponse(
         categories=categories_out,
-        nsfw_count=max(db_nsfw_count, mem_nsfw_count),
+        nsfw_count=max(db_nsfw_count, live_nsfw_count),
     )
 
 
