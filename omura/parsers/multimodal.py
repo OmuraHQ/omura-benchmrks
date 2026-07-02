@@ -11,7 +11,7 @@ from PIL import Image
 TEMP_DIR = Path(os.getenv("OMURA_TEMP_BLOB_DIR", "data/temp_blobs"))
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-SUPPORTED_IMAGE = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"})
+SUPPORTED_IMAGE = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp"})  # tiff/tif excluded: not browser-renderable
 SUPPORTED_VIDEO = frozenset({"mp4", "webm", "mov", "avi", "mkv", "ts", "m4v", "3gp", "flv", "ogv", "mpg", "mpeg"})
 SUPPORTED_AUDIO = frozenset({"mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"})
 SUPPORTED_DOC = frozenset({"pdf", "txt", "md", "markdown"})

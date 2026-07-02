@@ -184,12 +184,33 @@ def _parse_ftyp_major_brand(data: bytes) -> Optional[bytes]:
     return None
 
 
-def _classify_ftyp_brand(major: bytes) -> Tuple[str, str, str]:
+def _classify_ftyp_brand(major: bytes, sniff: bytes = b"") -> Tuple[str, str, str]:
+    """Classify an ISO BMFF container as image / audio / video.
+
+    Brand alone is unreliable: ``isom``/``mp42``/``mp41`` are used for both M4A audio
+    and MP4 video. We look at the handler types (``hdlr.vide`` / ``hdlr.soun``) inside
+    the moov box when the sniff window contains them. Heuristic:
+
+      - explicit audio brands (M4A/M4B/f4a/F4A/M4P) → audio
+      - explicit video brands (M4V/M4VH/M4VP/avc1) → video
+      - if sniff contains 'soun' AND not 'vide' → audio
+      - if sniff contains 'vide' (with or without 'soun') → video
+      - otherwise → default video (the historical assumption)
+    """
     if major in _FTYP_IMAGE_BRANDS:
         ext = "heic" if major.lower().startswith(b"hei") or major in (b"mif1", b"msf1") else "avif"
         return f"image/{ext}", ext, "image"
-    if major in _FTYP_AUDIO_BRANDS:
+    if major in _FTYP_AUDIO_BRANDS or major in (b"M4P ", b"mp4a", b"aac "):
         return "audio/mp4", "m4a", "audio"
+    if major in (b"M4V ", b"M4VH", b"M4VP", b"avc1"):
+        return "video/mp4", "mp4", "video"
+    if sniff:
+        has_vide = b"hdlr" in sniff and b"vide" in sniff
+        has_soun = b"hdlr" in sniff and b"soun" in sniff
+        if has_soun and not has_vide:
+            return "audio/mp4", "m4a", "audio"
+        if has_vide:
+            return "video/mp4", "mp4", "video"
     # Default: video container (mp4 / mov / etc.)
     return "video/mp4", "mp4", "video"
 
@@ -259,7 +280,7 @@ def _enhanced_magic_sniff(data: bytes) -> Optional[Tuple[str, str, str]]:
     # ISO BMFF (MP4 / MOV / M4A / HEIC / AVIF …)
     major = _parse_ftyp_major_brand(b)
     if major is not None:
-        return _classify_ftyp_brand(major)
+        return _classify_ftyp_brand(major, b)
 
     # --- Still images & PDF (fast paths) ---
     if b.startswith(b"%PDF-"):

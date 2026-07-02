@@ -22,7 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from omura.utils.blob_discovery import get_blob_discovery_source, iter_active_blob_entries
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch
+from omura.utils.blockberry import get_current_epoch
 
 
 def main() -> int:
@@ -63,7 +63,7 @@ def main() -> int:
     if epoch is None:
         epoch = get_current_epoch(silent=True)
     if epoch is None:
-        epoch = MANUAL_EPOCH
+        epoch = get_current_epoch()
 
     if not args.json:
         print(f"# discovery={get_blob_discovery_source()} epoch={epoch}", file=sys.stderr)

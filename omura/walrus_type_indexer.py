@@ -19,7 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from omura.parsers.file_detection import detect_file_type
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch
+from omura.utils.aggregator_pool import get_pool
+from omura.utils.blockberry import get_current_epoch
 from omura.utils.blob_discovery import iter_active_blob_entries
 
 
@@ -29,8 +30,8 @@ _EPOCH_CACHE_SEC = float(os.getenv("OMURA_INDEXER_EPOCH_CACHE_SEC", "300"))
 _cached_walrus_epoch: Optional[int] = None
 _cached_walrus_epoch_at: float = 0.0
 
-# Default to redundex mainnet read-only aggregator if no env override
-DEFAULT_AGGREGATOR = "https://walrus-mainnet-aggregator.redundex.com"
+# Default to omura mainnet aggregator tunnel if no env override
+DEFAULT_AGGREGATOR = "https://agrregator.omura.fun"
 AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", DEFAULT_AGGREGATOR).rstrip("/")
 
 
@@ -39,8 +40,11 @@ def _walrus_epoch_for_index_batch() -> int:
     now = time.monotonic()
     if _cached_walrus_epoch is not None and (now - _cached_walrus_epoch_at) < _EPOCH_CACHE_SEC:
         return _cached_walrus_epoch
-    e = get_current_epoch(silent=True)
-    _cached_walrus_epoch = MANUAL_EPOCH if e is None else e
+    try:
+        _cached_walrus_epoch = get_current_epoch(silent=True)
+    except Exception:
+        if _cached_walrus_epoch is None:
+            _cached_walrus_epoch = 0
     _cached_walrus_epoch_at = now
     return _cached_walrus_epoch
 
@@ -56,22 +60,19 @@ def _blob_expired_vs_epoch(metadata: Dict[str, Any], current_epoch: int) -> bool
 
 
 def fetch_blob_http(blob_id: str) -> Optional[bytes]:
-    """Fetch blob bytes from the configured HTTP aggregator.
+    """Fetch blob bytes via the aggregator pool (load-balanced across upstreams).
 
     Uses the raw numeric blob ID form, which is what Blockberry returns and
     what the HTTP API at `/v1/blobs/{id}` expects.
     """
-    url = f"{AGGREGATOR_URL}/v1/blobs/{blob_id}"
-    try:
-        resp = requests.get(url, timeout=60)
-        if resp.status_code == 200:
-            return resp.content
-        # Treat 404/410/400 as not-found; log minimally
-        print(f"{blob_id}: HTTP {resp.status_code} from aggregator")
+    resp, used = get_pool().get(f"/v1/blobs/{blob_id}", timeout=60)
+    if resp is None:
+        print(f"{blob_id}: all aggregator upstreams failed")
         return None
-    except requests.RequestException as e:
-        print(f"{blob_id}: HTTP error fetching from aggregator: {e}")
-        return None
+    if resp.status_code == 200:
+        return resp.content
+    print(f"{blob_id}: HTTP {resp.status_code} from {used}")
+    return None
 
 
 def _process_blob(blob_id: str, metadata: Dict[str, Any], walrus_epoch: int) -> None:

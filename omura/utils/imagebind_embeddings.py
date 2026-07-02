@@ -57,6 +57,9 @@ _QWEN_QUERY_INSTRUCTION = (
 _QWEN_DOCUMENT_INSTRUCTION = "Represent this document for retrieval."
 _QWEN_IMAGE_INSTRUCTION = "Retrieve images or text relevant to this image."
 
+_USE_FALLBACK_FOR_QWEN = False
+_FALLBACK_MODEL_NAME = "immortaltatsu/omura_emebd"
+
 
 def _target_embedding_dim() -> int:
     return int(os.getenv("OMURA_EMBEDDING_DIM", "768"))
@@ -194,15 +197,15 @@ def _is_gemma_model() -> bool:
 
 
 def _is_omura_emmbed_model() -> bool:
-    """Return True when the active backend is Omura Embed."""
+    """Return True when the active backend is Omura Embed or SigLIP."""
     backend = os.getenv("OMURA_EMBEDDING_BACKEND", "").strip().lower()
-    if backend in {"omura_emmbed", "omura_emmbed_v1"}:
+    if backend in {"omura_emmbed", "omura_emmbed_v1", "siglip", "siglip2"}:
         return True
     name = MODEL_NAME.lower()
     if "jina" in name:
         return False
     # HF repo id is `omura_emebd`; older docs used `omura_emmbed` (typo).
-    return ("omura_emebd" in name) or ("omura_emmbed" in name)
+    return ("omura_emebd" in name) or ("omura_emmbed" in name) or ("siglip" in name)
 
 
 def _is_jina_clip_model() -> bool:
@@ -215,6 +218,37 @@ def _is_qwen3_vl_embedding_model() -> bool:
     """Return True for Qwen3-VL embedding checkpoints."""
     name = MODEL_NAME.lower()
     return "qwen3-vl-embedding" in name
+
+
+def get_score_multiplier(query_kind: str = "text") -> float:
+    """Return the similarity→score multiplier based on query modality and model.
+
+    The multiplier converts raw cosine similarity into the user-facing 0-100
+    ``score``. The right scale depends on the *geometry of the comparison*:
+
+    - **Cross-modal (text→image)** similarities are naturally low (≈0.15-0.35),
+      so they need a large multiplier (450) to land a strong match near 90-100.
+    - **Same-modal (image→image, reverse search)** similarities are naturally
+      high (≈0.5-1.0). Reusing the cross-modal multiplier saturates *every*
+      result to 100 and destroys the ranking. A multiplier of 100 maps cosine
+      directly to a percentage (1.0→100, 0.6→60), giving a real gradient where
+      a near-duplicate scores ~90-100 and unrelated images score much lower.
+
+    Both paths therefore anchor a strong match near 100 while keeping the
+    reverse-image and text-search responses 1-to-1 in shape and scale.
+    """
+    if query_kind == "image":
+        # Same-modal cosine → direct percentage (no saturation).
+        return 100.0
+    if _is_qwen3_vl_embedding_model():
+        return 100.0
+    if _is_omura_emmbed_model():
+        return 450.0
+    if _is_jina_clip_model():
+        return 100.0
+    if _target_embedding_dim() >= 1024:
+        return 100.0
+    return 1000.0
 
 
 def _load_one(device: str, attn_impl: str) -> tuple:
@@ -935,7 +969,9 @@ def nsfw_similarity_score_0_100(
         c = float(np.dot(v, p))
         if c > best:
             best = c
-    return float(min(max(best, 0.0) * 1000.0, 100.0))
+    multiplier = get_score_multiplier()
+    return float(min(max(best, 0.0) * multiplier, 100.0))
+
 
 
 def nsfw_tag_score_min() -> float:

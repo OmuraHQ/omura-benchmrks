@@ -23,7 +23,7 @@ class SimpleWalrusClient:
         )
         aggregator_url = _get_env(
             "WALRUS_AGGREGATOR_URL",
-            "https://aggregator.walrus-mainnet.walrus.space",
+            "https://agrregator.omura.fun",
         )
         self.client = WalrusClient(
             publisher_base_url=publisher_url,

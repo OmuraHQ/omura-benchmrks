@@ -28,11 +28,12 @@ def blockberry_api_key() -> str:
     return (os.getenv("BLOCKBERRY_API_KEY") or "").strip()
 
 
-# Fallback when Blockberry epoch inference fails (active = end_epoch > this value)
-MANUAL_EPOCH = 27
-
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_TIMEOUT = 30
+
+
+class WalrusEpochError(RuntimeError):
+    """Raised when the current Walrus epoch cannot be resolved from any source."""
 
 
 def _item_size_int(item: Dict[str, Any]) -> int:
@@ -178,13 +179,38 @@ def _epoch_from_sui_dynamic_field_response(body: Dict[str, Any]) -> Optional[int
         return None
 
 
+def _sui_rpc_post(url: str, payload: Dict[str, Any], timeout: float) -> Optional[Dict[str, Any]]:
+    """POST a single JSON-RPC call; return parsed body or None on any failure."""
+    resp = requests.post(
+        url,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        return None
+    body, jerr = _parse_json_body(resp)
+    if jerr or not isinstance(body, dict):
+        return None
+    return body
+
+
 def get_walrus_epoch_from_sui_rpc(
     *, silent: bool = False, timeout: float = DEFAULT_TIMEOUT
 ) -> Optional[int]:
-    """Read current Walrus epoch from Sui mainnet via ``suix_getDynamicFieldObject``.
+    """Read current Walrus epoch from Sui mainnet.
 
-    Uses ``SUI_RPC_URL`` (default ``https://fullnode.mainnet.sui.io:443``),
-    ``WALRUS_SUI_SYSTEM_STATE_PARENT``, and ``WALRUS_SUI_DYNAMIC_FIELD_U64`` (default ``2``).
+    Walrus stores its state as a dynamic field on the ``staking`` object keyed by the
+    contract version. We:
+      1. Fetch the staking object to read its current ``version`` field.
+      2. Look up the dynamic field keyed by that version (type ``u64``).
+      3. Extract ``StakingInnerVN.epoch``.
+
+    This is robust across Walrus contract upgrades (v1, v2, v3, ...) — no hardcoded
+    field key. Set ``WALRUS_SUI_DYNAMIC_FIELD_U64`` to override version discovery for
+    testing; otherwise it is read live.
+
+    Env: ``SUI_RPC_URL``, ``WALRUS_SUI_SYSTEM_STATE_PARENT``.
     """
     rpc_url = (
         os.getenv("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
@@ -197,27 +223,49 @@ def get_walrus_epoch_from_sui_rpc(
         "WALRUS_SUI_SYSTEM_STATE_PARENT",
         "0x10b9d30c28448939ce6c4d6c6e0ffce4a7f8a4ada8248bdad09ef8b70e4a3904",
     ).strip()
-    field_u64 = os.getenv("WALRUS_SUI_DYNAMIC_FIELD_U64", "2").strip()
 
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "suix_getDynamicFieldObject",
-        "params": [parent, {"type": "u64", "value": str(field_u64)}],
-    }
     try:
-        resp = requests.post(
+        version_override = os.getenv("WALRUS_SUI_DYNAMIC_FIELD_U64", "").strip()
+        if version_override:
+            field_u64 = version_override
+        else:
+            body = _sui_rpc_post(
+                rpc_url,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "sui_getObject",
+                    "params": [parent, {"showContent": True}],
+                },
+                timeout,
+            )
+            if body is None:
+                if not silent:
+                    print("  Sui RPC: failed to fetch staking object", file=sys.stderr)
+                return None
+            try:
+                field_u64 = str(
+                    body["result"]["data"]["content"]["fields"]["version"]
+                )
+            except (KeyError, TypeError) as e:
+                if not silent:
+                    print(
+                        f"  Sui RPC: staking object missing version field: {e}",
+                        file=sys.stderr,
+                    )
+                return None
+
+        body = _sui_rpc_post(
             rpc_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=timeout,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "suix_getDynamicFieldObject",
+                "params": [parent, {"type": "u64", "value": field_u64}],
+            },
+            timeout,
         )
-        if resp.status_code != 200:
-            if not silent:
-                print(f"  Sui RPC HTTP {resp.status_code}", file=sys.stderr)
-            return None
-        body, jerr = _parse_json_body(resp)
-        if jerr or not isinstance(body, dict):
+        if body is None:
             return None
         return _epoch_from_sui_dynamic_field_response(body)
     except requests.RequestException as e:
@@ -295,8 +343,12 @@ def _infer_walrus_epoch_from_blockberry(*, silent: bool = False) -> Optional[int
         return None
 
 
-def get_current_epoch(*, silent: bool = False) -> Optional[int]:
-    """Resolve current Walrus epoch: Sui RPC first, then Blockberry heuristics (see ``OMURA_WALRUS_EPOCH_SOURCE``)."""
+def get_current_epoch(*, silent: bool = False) -> int:
+    """Resolve current Walrus epoch from Sui RPC, then Blockberry heuristics.
+
+    Raises ``WalrusEpochError`` if no source produces an epoch. Callers that need
+    a sentinel value should catch this explicitly — there is no implicit fallback.
+    """
     source = os.getenv("OMURA_WALRUS_EPOCH_SOURCE", "auto").strip().lower()
     if source not in ("auto", "sui", "blockberry"):
         source = "auto"
@@ -313,15 +365,17 @@ def get_current_epoch(*, silent: bool = False) -> Optional[int]:
                 print(f"  Walrus epoch (Sui): {ep}")
             return ep
         if source == "sui":
-            if not silent:
-                print("  Sui RPC did not return a Walrus epoch.")
-            return None
+            raise WalrusEpochError("Sui RPC did not return a Walrus epoch.")
         if not silent:
             print("  Sui RPC failed or empty; falling back to Blockberry...")
 
     if try_bb:
-        return _infer_walrus_epoch_from_blockberry(silent=silent)
-    return None
+        ep = _infer_walrus_epoch_from_blockberry(silent=silent)
+        if ep is not None:
+            return ep
+    raise WalrusEpochError(
+        "Could not resolve current Walrus epoch from Sui RPC or Blockberry."
+    )
 
 
 def get_all_blob_ids() -> Tuple[List[str], List[str], Dict[str, Any]]:
@@ -333,8 +387,7 @@ def get_all_blob_ids() -> Tuple[List[str], List[str], Dict[str, Any]]:
     print(f"Connecting to Blockberry API: {BLOCKBERRY_API_URL}")
     print("Fetching ALL active Walrus blob IDs...\n")
 
-    # For now, use manual epoch override (21)
-    current_epoch = MANUAL_EPOCH
+    current_epoch = get_current_epoch()
     print("Using Walrus epoch for filtering...")
     print(f"Current Walrus epoch: {current_epoch}")
     print(f"Filtering for blobs with end_epoch > {current_epoch} (active blobs only)\n")
@@ -630,7 +683,7 @@ def iter_active_blobs(
     null/unknown sizes do not jump ahead of large blobs.
 
     Args:
-        current_epoch: Walrus epoch for filtering active blobs. If None, uses MANUAL_EPOCH.
+        current_epoch: Walrus epoch for filtering active blobs. If None, resolved via ``get_current_epoch()``.
         start_page: Page number to start from (for resuming indexing).
         sort_by: Blockberry ``sortBy`` param (e.g. ``SIZE``, ``TIMESTAMP``).
         order_by: Blockberry ``orderBy`` param (``ASC`` or ``DESC``).
@@ -639,7 +692,7 @@ def iter_active_blobs(
         (page_number, blob_id, metadata) tuples
     """
     if current_epoch is None:
-        current_epoch = MANUAL_EPOCH
+        current_epoch = get_current_epoch()
 
     print(f"Streaming active Walrus blobs (epoch > {current_epoch}) from Blockberry...")
     if not blockberry_api_key():
@@ -835,6 +888,7 @@ def iter_active_blobs(
 
 
 __all__ = [
+    "WalrusEpochError",
     "blockberry_api_key",
     "get_blob_details_by_id",
     "get_current_epoch",

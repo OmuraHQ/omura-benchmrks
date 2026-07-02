@@ -55,12 +55,16 @@ class VectorStore:
     - 'cuvs': Use NVIDIA cuVS (GPU, experimental/fast).
     """
 
-    def __init__(self, index_path: Optional[Path] = None):
+    def __init__(self, index_path: Optional[Path] = None, embedding_dim: Optional[int] = None):
         """Initialize vector store.
 
         Args:
             index_path: Path to save/load the index. If None, uses default.
+            embedding_dim: Per-instance embedding dimension. If None, uses the
+                module-level EMBEDDING_DIM. Lets a separate store (e.g. a 512-d
+                CLAP audio index) coexist with the main store in one process.
         """
+        self.embedding_dim = int(embedding_dim) if embedding_dim else EMBEDDING_DIM
         self.backend = os.getenv("OMURA_VECTOR_BACKEND", "faiss").lower()
         
         # Validate backend availability
@@ -157,7 +161,7 @@ class VectorStore:
     def _init_faiss_index(self):
         """Initialize a new FAISS index."""
         # Use IndexFlatIP (Inner Product) for exact search with cosine similarity on normalized vectors
-        self.index = faiss.IndexFlatIP(EMBEDDING_DIM)
+        self.index = faiss.IndexFlatIP(self.embedding_dim)
         self._is_built = True
 
     def add(
@@ -177,9 +181,9 @@ class VectorStore:
             size: Blob size in bytes
             **extra_metadata: Additional metadata fields
         """
-        if embedding.shape[0] != EMBEDDING_DIM:
+        if embedding.shape[0] != self.embedding_dim:
             raise ValueError(
-                f"Expected embedding dimension {EMBEDDING_DIM}, "
+                f"Expected embedding dimension {self.embedding_dim}, "
                 f"got {embedding.shape[0]}"
             )
 
@@ -686,14 +690,29 @@ class VectorStore:
         if not self._save_lock.acquire(blocking=False):
             print("[VectorStore] Save already in progress, skipping duplicate save")
             return
-        
+
         try:
+            # Apply persisted sweep blacklist before every save so the indexer
+            # can never restore blobs that were removed by a sweep running in
+            # another worker process.
+            blacklist_path = self.index_path.parent / "deleted_blobs.json"
+            try:
+                if blacklist_path.exists():
+                    with open(blacklist_path) as _blf:
+                        blacklisted = set(json.load(_blf))
+                    to_drop = [b for b in blacklisted if b in self.metadata or b in self.embeddings_dict]
+                    if to_drop:
+                        print(f"[VectorStore] Blacklist: removing {len(to_drop)} swept blobs before save")
+                        self.remove_blob_ids(to_drop)
+            except Exception as _bl_err:
+                print(f"[VectorStore] Warning: could not apply sweep blacklist: {_bl_err}")
+
             if create_backup:
                 try:
                     self._create_backup()
                 except Exception as e:
                     print(f"[VectorStore] Warning: Backup creation failed: {e}")
-            
+
             # Save Index
             if self._is_built and self.index is not None:
                 try:
@@ -750,10 +769,10 @@ class VectorStore:
         if embeddings_path.exists():
             try:
                 embeddings_array = np.load(str(embeddings_path))
-                if embeddings_array.size > 0 and embeddings_array.shape[-1] != EMBEDDING_DIM:
+                if embeddings_array.size > 0 and embeddings_array.shape[-1] != self.embedding_dim:
                     print(
                         f"[VectorStore] Skipping load: embeddings dim {embeddings_array.shape[-1]} != "
-                        f"EMBEDDING_DIM {EMBEDDING_DIM}. Use OMURA_VECTOR_INDEX_VERSION=omni and re-index."
+                        f"embedding_dim {self.embedding_dim}. Use OMURA_VECTOR_INDEX_VERSION=omni and re-index."
                     )
                     self.embeddings_list = []
                     self.embeddings_dict = {}
@@ -951,9 +970,19 @@ class VectorStore:
         if dry_run or expired_count == 0:
             return summary
 
-        expired_set = set(expired_blob_ids)
+        self.remove_blob_ids(expired_blob_ids)
+        return summary
 
-        for blob_id in expired_blob_ids:
+    def remove_blob_ids(self, blob_ids: List[str]) -> int:
+        """Remove a set of blob_ids from metadata, embeddings, and index. Returns count removed.
+
+        Caller is responsible for calling ``save()`` afterwards.
+        """
+        targets = set(b for b in blob_ids if b in self.embeddings_dict or b in self.metadata)
+        if not targets:
+            return 0
+
+        for blob_id in targets:
             self.metadata.pop(blob_id, None)
             self.embeddings_dict.pop(blob_id, None)
 
@@ -962,7 +991,7 @@ class VectorStore:
         new_embeddings_list: List[np.ndarray] = []
 
         for blob_id in self.position_to_blob_id:
-            if blob_id in expired_set:
+            if blob_id in targets:
                 continue
             embedding = self.embeddings_dict.get(blob_id)
             if embedding is None:
@@ -996,7 +1025,7 @@ class VectorStore:
                 self.index = None
                 self._is_built = False
 
-        return summary
+        return len(targets)
 
     def clear(self) -> None:
         """Clear all embeddings and metadata."""

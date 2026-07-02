@@ -6,6 +6,8 @@ Run:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import requests
 
@@ -39,7 +41,7 @@ def _unique_rows(vectors: list[np.ndarray]) -> int:
 def _fresh_embeddings_for_blob_ids(blob_ids: list[str]) -> list[np.ndarray]:
     out = []
     for blob_id in blob_ids:
-        url = f"https://walrus-mainnet-aggregator.redundex.com/v1/blobs/{blob_id}"
+        url = f"{os.getenv('WALRUS_AGGREGATOR_URL', 'https://agrregator.omura.fun').rstrip('/')}/v1/blobs/{blob_id}"
         resp = requests.get(url, timeout=60)
         if resp.status_code != 200:
             continue

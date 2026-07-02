@@ -11,6 +11,8 @@ import threading
 import time
 
 from omura.indexers.vector_indexer import run_vector_indexer
+from omura.indexers.bellyseal_indexer import start_bellyseal_indexer_thread
+from omura.indexers.walrus_blob_indexer import start_walrus_blob_indexer_thread
 from omura.cataloger import run_cataloger
 from omura.utils.blob_catalog import CATALOG_DB_PATH, init_catalog_db
 from omura.utils.vector_store import VectorStore
@@ -58,6 +60,9 @@ def run_worker_service() -> None:
     store.load()
     print(f"[Worker] Vector store ready ({store.size()} embeddings)")
 
+    # Shared lock so BellySeal indexer and vector indexer don't race on store writes.
+    store_lock = threading.Lock()
+
     print("[Worker] Loading embedding model...")
     initialize_embedding_model()
     print("[Worker] Embedding model ready")
@@ -69,6 +74,16 @@ def run_worker_service() -> None:
     if os.getenv("OMURA_ENABLE_INDEXER", "true").lower() == "true":
         threads.append(_start_daemon(lambda: _run_indexer_loop(store), "vector-indexer"))
         print("[Worker] Vector indexer started")
+    if os.getenv("OMURA_BELLYSEAL_ENABLED", "true").lower() == "true":
+        t = start_bellyseal_indexer_thread(store, store_lock)
+        if t:
+            threads.append(t)
+            print("[Worker] BellySeal live indexer started")
+    if os.getenv("OMURA_WALRUS_INDEXER_ENABLED", "true").lower() == "true":
+        t = start_walrus_blob_indexer_thread(store, store_lock)
+        if t:
+            threads.append(t)
+            print("[Worker] Walrus blob indexer started")
 
     if not threads:
         print("[Worker] Nothing enabled (set OMURA_ENABLE_CATALOGER/INDEXER=true)")

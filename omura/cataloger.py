@@ -44,8 +44,9 @@ from omura.utils.blob_catalog import (
     init_catalog_db,
     upsert_blobs_batch,
 )
+from omura.utils.aggregator_pool import get_pool
 from omura.utils.blob_discovery import iter_all_blob_entries
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch
+from omura.utils.blockberry import get_current_epoch
 
 try:
     from tqdm import tqdm
@@ -56,10 +57,10 @@ except Exception:  # pragma: no cover - optional dependency
 
 BATCH_SIZE = int(os.getenv("OMURA_CATALOGER_BATCH_SIZE", "200"))
 MAX_WORKERS = int(os.getenv("OMURA_CATALOGER_WORKERS", "32"))
-LISTEN_INTERVAL = int(os.getenv("OMURA_CATALOGER_LISTEN_INTERVAL", "60"))
+LISTEN_INTERVAL = int(os.getenv("OMURA_CATALOGER_LISTEN_INTERVAL", "10"))
 LISTEN_MAX_PAGES = int(os.getenv("OMURA_CATALOGER_LISTEN_PAGES", "5"))
 
-DEFAULT_AGGREGATOR = "https://walrus-mainnet-aggregator.redundex.com"
+DEFAULT_AGGREGATOR = "https://agrregator.omura.fun"
 AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", DEFAULT_AGGREGATOR).rstrip("/")
 
 # Number of bytes to stream for type detection (magic bytes only)
@@ -105,8 +106,11 @@ def _current_epoch() -> int:
         now = time.monotonic()
         if _epoch_val is not None and (now - _epoch_at) < _EPOCH_TTL:
             return _epoch_val
-        e = get_current_epoch(silent=True)
-        _epoch_val = MANUAL_EPOCH if e is None else e
+        try:
+            _epoch_val = get_current_epoch(silent=True)
+        except Exception:
+            if _epoch_val is None:
+                _epoch_val = 0
         _epoch_at = now
         return _epoch_val
 
@@ -115,44 +119,53 @@ def _current_epoch() -> int:
 
 
 def _sniff_blob(blob_id: str) -> Tuple[Optional[bytes], Optional[int]]:
-    """Stream the first SNIFF_BYTES from a blob. Returns (prefix, content_length)."""
-    url = f"{AGGREGATOR_URL}/v1/blobs/{blob_id}"
-    try:
-        # Fast path: request just the first bytes needed for type sniffing.
-        hdr = {"Range": f"bytes=0-{SNIFF_BYTES - 1}"}
-        resp = _session().get(url, timeout=20, headers=hdr)
-        if resp.status_code in (200, 206):
-            prefix = resp.content[:SNIFF_BYTES]
-            content_range = resp.headers.get("content-range")
-            content_length = resp.headers.get("content-length")
-            actual_size = None
-            if content_range and "/" in content_range:
-                try:
-                    actual_size = int(content_range.rsplit("/", 1)[-1])
-                except ValueError:
-                    actual_size = None
-            if actual_size is None and content_length:
-                try:
-                    actual_size = int(content_length)
-                except ValueError:
-                    actual_size = None
-            return prefix, actual_size
+    """Stream the first SNIFF_BYTES from a blob via the aggregator pool.
 
-        # Fallback for gateways that ignore byte-range.
-        resp = _session().get(url, timeout=30, stream=True)
-        if resp.status_code != 200:
-            return None, None
+    Load is spread across all upstreams; failed upstreams trip out automatically.
+    """
+    pool = get_pool()
+    sess = _session()
+    # Fast path: request just the first bytes needed for type sniffing.
+    hdr = {"Range": f"bytes=0-{SNIFF_BYTES - 1}"}
+    resp, _ = pool.get(
+        f"/v1/blobs/{blob_id}", session=sess, timeout=20, headers=hdr
+    )
+    if resp is None:
+        return None, None
+    if resp.status_code in (200, 206):
+        prefix = resp.content[:SNIFF_BYTES]
+        content_range = resp.headers.get("content-range")
         content_length = resp.headers.get("content-length")
-        actual_size = int(content_length) if content_length else None
-        prefix = b""
+        actual_size = None
+        if content_range and "/" in content_range:
+            try:
+                actual_size = int(content_range.rsplit("/", 1)[-1])
+            except ValueError:
+                actual_size = None
+        if actual_size is None and content_length:
+            try:
+                actual_size = int(content_length)
+            except ValueError:
+                actual_size = None
+        return prefix, actual_size
+
+    # Fallback for gateways that ignore byte-range — pool retries across upstreams.
+    resp, _ = pool.get(f"/v1/blobs/{blob_id}", session=sess, timeout=30, stream=True)
+    if resp is None or resp.status_code != 200:
+        return None, None
+    content_length = resp.headers.get("content-length")
+    actual_size = int(content_length) if content_length else None
+    prefix = b""
+    try:
         for chunk in resp.iter_content(SNIFF_BYTES):
             prefix += chunk
             if len(prefix) >= SNIFF_BYTES:
                 break
-        resp.close()
-        return prefix[:SNIFF_BYTES], actual_size
     except requests.RequestException:
+        resp.close()
         return None, None
+    resp.close()
+    return prefix[:SNIFF_BYTES], actual_size
 
 
 def _process_one(
@@ -311,7 +324,11 @@ def _backfill(db_path: Path) -> None:
 
     while True:  # retry discovery errors forever
         try:
-            for page, blob_id, meta, is_active in iter_all_blob_entries(start_page=start_page):
+            for page, blob_id, meta, is_active in iter_all_blob_entries(
+                start_page=start_page,
+                sort_by="TIMESTAMP",
+                order_by="DESC",
+            ):
                 current_page = page
                 epoch = _current_epoch()
                 batch.append((blob_id, meta, is_active))

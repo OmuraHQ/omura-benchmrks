@@ -355,11 +355,10 @@ def iter_active_blob_entries(
         src = "blockberry"
 
     if current_epoch is None:
-        from omura.utils.blockberry import MANUAL_EPOCH
-
-        current_epoch = get_current_epoch(silent=True)
-        if current_epoch is None:
-            current_epoch = MANUAL_EPOCH
+        try:
+            current_epoch = get_current_epoch(silent=True)
+        except Exception:
+            current_epoch = 0
 
     if src == "blockberry":
         yield from _iter_blockberry(
@@ -416,12 +415,17 @@ def iter_all_blobs_blockberry(
         (page, blob_id, metadata, is_active) tuples
     """
     from omura.utils.blockberry import (
-        MANUAL_EPOCH,
+        get_current_epoch,
         get_headers,
         DEFAULT_PAGE_SIZE,
         _parse_json_body,
         _blob_list_sort_by_size,
     )
+
+    try:
+        current_epoch = get_current_epoch(silent=True)
+    except Exception:
+        current_epoch = 0
     from tqdm import tqdm
 
     import time
@@ -503,7 +507,7 @@ def iter_all_blobs_blockberry(
                     continue
 
                 end_epoch = item.get("endEpoch") or item.get("end_epoch")
-                is_active = end_epoch is not None and int(end_epoch) > MANUAL_EPOCH
+                is_active = end_epoch is not None and int(end_epoch) > current_epoch
 
                 if is_active:
                     total_active += 1

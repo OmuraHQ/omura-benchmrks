@@ -49,7 +49,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from omura.utils.blob_discovery import iter_active_blob_entries  # type: ignore
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch  # type: ignore
+from omura.utils.blockberry import get_current_epoch  # type: ignore
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -102,8 +102,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def current_walrus_epoch() -> int:
     ep = get_current_epoch(silent=True)
-    if ep is None:
-        ep = MANUAL_EPOCH
     return int(ep)
 
 

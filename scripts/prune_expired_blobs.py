@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch
+from omura.utils.blockberry import get_current_epoch
 from omura.utils.vector_store import VECTOR_STORE_DIR, VectorStore
 
 
@@ -25,12 +25,7 @@ def _resolve_epoch(explicit_epoch: int | None) -> int:
     if explicit_epoch is not None:
         return explicit_epoch
 
-    detected = get_current_epoch()
-    if detected is not None:
-        return detected
-
-    print(f"Could not auto-detect current epoch. Falling back to MANUAL_EPOCH={MANUAL_EPOCH}.")
-    return MANUAL_EPOCH
+    return get_current_epoch()
 
 
 def main() -> int:

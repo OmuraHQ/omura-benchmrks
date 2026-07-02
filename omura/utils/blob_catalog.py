@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS blobs (
     is_nsfw         INTEGER DEFAULT 0,
     nsfw_score      REAL,
     cluster_id      INTEGER,
+    -- Text search
+    caption         TEXT,
     -- Timestamps
     first_seen_at   TEXT NOT NULL,
     last_updated_at TEXT NOT NULL
@@ -115,6 +117,57 @@ def init_catalog_db(db_path: Path = CATALOG_DB_PATH) -> None:
         conn.execute(_CREATE_CLUSTERS)
         for idx_sql in _INDEXES:
             conn.execute(idx_sql)
+        # Migrations
+        try:
+            conn.execute("ALTER TABLE blobs ADD COLUMN caption TEXT")
+        except sqlite3.OperationalError:
+            pass
+            
+        # Create FTS5 virtual table
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS blobs_fts USING fts5(blob_id UNINDEXED, caption)")
+        
+        # Drop old triggers to ensure we replace them with corrected ones
+        conn.execute("DROP TRIGGER IF EXISTS blobs_after_insert")
+        conn.execute("DROP TRIGGER IF EXISTS blobs_after_update")
+        conn.execute("DROP TRIGGER IF EXISTS blobs_after_delete")
+
+        # Setup Triggers for blobs_fts synchronization
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS blobs_after_insert AFTER INSERT ON blobs
+            BEGIN
+                DELETE FROM blobs_fts WHERE blob_id = new.blob_id;
+                INSERT INTO blobs_fts(blob_id, caption) VALUES(new.blob_id, new.caption);
+            END;
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS blobs_after_update AFTER UPDATE OF caption ON blobs
+            BEGIN
+                DELETE FROM blobs_fts WHERE blob_id = new.blob_id;
+                INSERT INTO blobs_fts(blob_id, caption) VALUES(new.blob_id, new.caption);
+            END;
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS blobs_after_delete AFTER DELETE ON blobs
+            BEGIN
+                DELETE FROM blobs_fts WHERE blob_id = old.blob_id;
+            END;
+            """
+        )
+        
+        # Clean up existing duplicate rows in blobs_fts and repopulate cleanly
+        conn.execute("DELETE FROM blobs_fts")
+        conn.execute(
+            """
+            INSERT INTO blobs_fts(blob_id, caption)
+            SELECT blob_id, caption FROM blobs
+            WHERE caption IS NOT NULL AND is_active = 1
+            """
+        )
         conn.commit()
 
 
@@ -239,6 +292,7 @@ def mark_indexed(
     is_nsfw: bool = False,
     nsfw_score: float = 0.0,
     cluster_id: Optional[int] = None,
+    caption: Optional[str] = None,
     db_path: Path = CATALOG_DB_PATH,
 ) -> None:
     try:
@@ -251,10 +305,11 @@ def mark_indexed(
                     is_nsfw = ?,
                     nsfw_score = ?,
                     cluster_id = ?,
+                    caption = ?,
                     last_updated_at = ?
                 WHERE blob_id = ?
                 """,
-                (1 if is_nsfw else 0, nsfw_score, cluster_id, _now(), blob_id),
+                (1 if is_nsfw else 0, nsfw_score, cluster_id, caption, _now(), blob_id),
             )
             conn.commit()
     except Exception as exc:
@@ -265,7 +320,7 @@ def mark_indexed_batch(
     records: List[Dict[str, Any]],
     db_path: Path = CATALOG_DB_PATH,
 ) -> None:
-    """Batch update indexed status. Each record: {blob_id, is_nsfw, nsfw_score, cluster_id}."""
+    """Batch update indexed status. Each record: {blob_id, is_nsfw, nsfw_score, cluster_id, caption}."""
     if not records:
         return
     now = _now()
@@ -274,6 +329,7 @@ def mark_indexed_batch(
             1 if r.get("is_nsfw") else 0,
             float(r.get("nsfw_score", 0.0)),
             r.get("cluster_id"),
+            r.get("caption"),
             now,
             r["blob_id"],
         )
@@ -286,7 +342,7 @@ def mark_indexed_batch(
                 UPDATE blobs SET
                     indexed=1, status='indexed',
                     is_nsfw=?, nsfw_score=?, cluster_id=?,
-                    last_updated_at=?
+                    caption=?, last_updated_at=?
                 WHERE blob_id=?
                 """,
                 rows,
@@ -408,10 +464,31 @@ def get_clusters(db_path: Path = CATALOG_DB_PATH) -> List[Dict[str, Any]]:
         return []
 
 
-def update_cluster(cluster_id: int, db_path: Path = CATALOG_DB_PATH) -> None:
-    """Update cluster metadata."""
-    # Placeholder - cluster updates happen in the indexer
-    pass
+def update_cluster(
+    cluster_id: int,
+    label: Optional[str] = None,
+    size: Optional[int] = None,
+    centroid_blob_id: Optional[str] = None,
+    db_path: Path = CATALOG_DB_PATH,
+) -> None:
+    """Upsert cluster metadata into the ``clusters`` table."""
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as conn:
+            conn.execute(
+                """
+                INSERT INTO clusters (cluster_id, label, size, centroid_blob_id, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(cluster_id) DO UPDATE SET
+                    label = COALESCE(excluded.label, clusters.label),
+                    size = COALESCE(excluded.size, clusters.size),
+                    centroid_blob_id = COALESCE(excluded.centroid_blob_id, clusters.centroid_blob_id),
+                    updated_at = excluded.updated_at
+                """,
+                (cluster_id, label, size, centroid_blob_id, _now()),
+            )
+            conn.commit()
+    except Exception as exc:
+        print(f"[BlobCatalog] update_cluster error: {exc}")
 
 
 __all__ = [

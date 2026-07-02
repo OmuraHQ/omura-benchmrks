@@ -21,7 +21,7 @@ from fastapi import (
 )
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch
+from omura.utils.blockberry import get_current_epoch
 from omura.utils.imagebind_embeddings import (
     get_nsfw_embeddings,
     generate_image_embedding,
@@ -40,6 +40,57 @@ CLASSIFY_MARGIN_LOW = float(os.getenv("OMURA_CLASSIFY_MARGIN_LOW", "0.008"))
 NSFW_SEMANTIC_SCORE_THRESHOLD = float(
     os.getenv("OMURA_NSFW_SEMANTIC_SCORE_THRESHOLD", "0.62")
 )
+
+# Maximal Marginal Relevance reranking — suppresses near-duplicate / same-collection
+# hits (NFT quilts in particular). λ=1.0 disables diversity (pure cosine); λ=0.0 is
+# pure diversity. Off by default; enable with OMURA_RERANK_MMR=true.
+RERANK_MMR_ENABLED = os.getenv("OMURA_RERANK_MMR", "false").lower() == "true"
+RERANK_MMR_LAMBDA = float(os.getenv("OMURA_RERANK_MMR_LAMBDA", "0.85"))
+# Extra additive penalty when a candidate shares parent_quilt_id with an already-selected
+# result. Raise to spread different collections; 0 disables the quilt-level penalty.
+RERANK_SAME_QUILT_PENALTY = float(os.getenv("OMURA_RERANK_SAME_QUILT_PENALTY", "0.15"))
+
+# Cluster-based reranking: cluster candidate embeddings on-the-fly (MiniBatchKMeans),
+# then return one representative per cluster in cluster-rank order. Cluster rank is the
+# sum of member similarities to the query — clusters whose members are most relevant
+# rank first. Solves NFT-collection over-representation: a 50-NFT collection becomes
+# ONE cluster contributing ONE result, not 50 near-duplicates.
+RERANK_CLUSTER_ENABLED = os.getenv("OMURA_RERANK_CLUSTER", "false").lower() == "true"
+# n_clusters = top_k * RERANK_CLUSTER_K_MULT, clamped to len(candidates).
+# >1.0 gives slack (some clusters yield ≥2 picks if needed to fill top_k).
+RERANK_CLUSTER_K_MULT = float(os.getenv("OMURA_RERANK_CLUSTER_K_MULT", "2.0"))
+# How many candidates to cluster over. Higher = better cluster quality but slower.
+RERANK_CLUSTER_OVERFETCH_MULT = int(os.getenv("OMURA_RERANK_CLUSTER_OVERFETCH", "30"))
+
+# Multi-signal soft reranker — conservative; preserves top hit, only adjusts lower ranks.
+# Combines embedding similarity (primary) with content-quality signals.
+RERANK_SOFT_ENABLED = os.getenv("OMURA_RERANK_SOFT", "true").lower() == "true"
+# How strongly each signal moves a candidate. 0 disables the signal.
+RERANK_W_SIM = float(os.getenv("OMURA_RERANK_W_SIM", "1.0"))         # similarity weight (always primary)
+RERANK_W_NSFW_PENALTY = float(os.getenv("OMURA_RERANK_W_NSFW", "0.15"))  # penalty fraction per unit NSFW score
+RERANK_W_DUPE_PENALTY = float(os.getenv("OMURA_RERANK_W_DUPE", "0.20"))  # penalty when same parent_quilt_id repeats
+RERANK_W_TINY_PENALTY = float(os.getenv("OMURA_RERANK_W_TINY", "0.10"))  # penalty for sub-10KB images (likely thumbnails / broken)
+RERANK_W_RECENT_BOOST = float(os.getenv("OMURA_RERANK_W_RECENT", "0.05"))  # boost for blobs catalogued in the last 24h
+RERANK_PRESERVE_TOP_N = int(os.getenv("OMURA_RERANK_PRESERVE_TOP_N", "1"))  # never demote first N hits
+
+RERANK_W_NFT_PENALTY = 0.0
+
+# Hybrid (text+FTS/BM25) fusion. DISABLED by default: the auto-generated captions are
+# noisy, so keyword-matching the caption pollutes results — a blob whose caption merely
+# contains "cat" gets boosted to the top even when its image is not cat-like (true
+# cosine ~0.05). With FTS off, both text and reverse-image search rank purely by
+# embedding (visual-semantic) similarity, keeping them truly 1-to-1. Set
+# OMURA_SEARCH_HYBRID_FTS=true to re-enable the caption-fusion path.
+HYBRID_FTS_ENABLED = os.getenv("OMURA_SEARCH_HYBRID_FTS", "false").lower() == "true"
+# When hybrid FTS is on, a caption match gets an effective similarity floor of
+# FTS_SIM_TOP decaying by FTS_SIM_DECAY per FTS rank (×450 text multiplier → ~90).
+FTS_SIM_TOP = float(os.getenv("OMURA_FTS_SIM_TOP", "0.20"))
+FTS_SIM_DECAY = float(os.getenv("OMURA_FTS_SIM_DECAY", "0.005"))
+
+# Greedy MMR pass after soft rerank — same-image-embedding similarity dedup.
+# Solves "wizard cat shown 3 times" duplicates that no other signal catches.
+RERANK_MMR_AFTER_SOFT = os.getenv("OMURA_RERANK_MMR_AFTER_SOFT", "true").lower() == "true"
+RERANK_MMR_AFTER_LAMBDA = float(os.getenv("OMURA_RERANK_MMR_AFTER_LAMBDA", "0.7"))
 
 
 def _normalize_kind(kind: Optional[str]) -> Optional[str]:
@@ -141,6 +192,32 @@ class SearchRequest(BaseModel):
     instruction: Optional[str] = None
     top_k: int = 10
     exclude_nsfw: bool = True
+
+
+class InVideoSearchRequest(BaseModel):
+    blob_id: Optional[str] = None
+    query: Optional[str] = None
+    top_k: int = 5
+    win_sec: float = 4.0
+    stride_sec: float = 2.0
+
+
+class InVideoSearchResponse(BaseModel):
+    blob_id: str
+    query: str
+    duration: Optional[float] = None
+    source: Optional[str] = None
+    blob_url: Optional[str] = None
+    segments: List[Dict[str, Any]]
+
+
+class ReverseImageResponse(BaseModel):
+    results: List[Dict[str, Any]]
+    total: int
+    query_phash: Optional[str] = None
+    duplicates_found: int = 0
+    exact_duplicate_blob_id: Optional[str] = None
+    provenance: Optional[Dict[str, Any]] = None
 
 
 class MediaBlobCounterResponse(BaseModel):
@@ -335,10 +412,478 @@ def get_vector_store() -> VectorStore:
         return _shared_vector_store
 
 
+# ── Modality-specific stores (audio = CLAP 512-d, video = omura-embed-video 768-d) ──
+# These are independent of the main image/text store: different models, different
+# dims, separate FAISS indexes. Search is exact cosine over a single-modality index,
+# so no image-specific FTS / NFT / cluster reranking is applied.
+_shared_audio_vector_store: Optional[VectorStore] = None
+_shared_video_vector_store: Optional[VectorStore] = None
+
+
+def set_shared_audio_vector_store(store: VectorStore) -> None:
+    global _shared_audio_vector_store
+    _shared_audio_vector_store = store
+    print(f"[Search] Shared AUDIO (CLAP) store set with {len(store.metadata)} items")
+
+
+def set_shared_video_vector_store(store: VectorStore) -> None:
+    global _shared_video_vector_store
+    _shared_video_vector_store = store
+    print(f"[Search] Shared VIDEO store set with {len(store.metadata)} items")
+
+
+# Serve-time precheck: drop (and self-heal) audio/video results whose blob 404s.
+# Default OFF: the per-query 404 HEAD-probes add latency and block the event loop. The store is
+# kept clean by the /blob 404-prune + periodic sweep, so the precheck is opt-in only.
+_SEARCH_PRECHECK = os.getenv("OMURA_SEARCH_PRECHECK", "0") not in ("0", "false", "False", "")
+_PRECHECK_TIMEOUT = float(os.getenv("OMURA_PRECHECK_TIMEOUT", "6"))
+
+
+def _probe_blob_status(blob_id: str) -> int:
+    """HEAD-probe a blob (plain or quilt-patch) via the aggregator pool. Returns the HTTP
+    status (404 = gone), or -1 on network error (treated as 'keep', not broken)."""
+    from omura.utils.aggregator_pool import get_pool
+    import requests as _rq
+    if "::" in blob_id:
+        quilt, ident = blob_id.split("::", 1)
+        path = f"/v1/blobs/by-quilt-id/{quilt}/{_rq.utils.quote(ident, safe='')}"
+    else:
+        path = f"/v1/blobs/{blob_id}"
+    try:
+        resp, _ = get_pool().head(path, timeout=_PRECHECK_TIMEOUT, allow_redirects=True)
+        if resp is None:
+            return -1
+        if resp.status_code in (405, 501):  # some upstreams reject HEAD
+            resp, _ = get_pool().get(path, headers={"Range": "bytes=0-0"},
+                                     timeout=_PRECHECK_TIMEOUT, stream=True)
+            if resp is not None:
+                resp.close()
+            return resp.status_code if resp is not None else -1
+        return resp.status_code
+    except Exception:
+        return -1
+
+
+def _prune_broken_modality_blobs(store: VectorStore, blob_ids: List[str]) -> None:
+    """Remove 404'd blobs from a modality store and mark them expired in the catalog so they
+    stop being served. Best-effort; runs in a background thread."""
+    if not blob_ids:
+        return
+    try:
+        with store._lock:
+            removed = store.remove_blob_ids(blob_ids)
+            if removed > 0:
+                store.save(create_backup=False)
+        with sqlite3.connect(str(CATALOG_DB_PATH), timeout=15) as conn:
+            conn.executemany(
+                "UPDATE blobs SET is_active = 0, status = 'expired' WHERE blob_id = ?",
+                [(b,) for b in blob_ids],
+            )
+            conn.commit()
+        print(f"[precheck] pruned {len(blob_ids)} broken blobs (removed {removed} from store)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[precheck] prune failed: {e}")
+
+
+def _modality_search(
+    store: Optional[VectorStore],
+    qemb: Optional[np.ndarray],
+    top_k: int,
+    kind: str,
+    exclude_nsfw: bool,
+) -> SearchResponse:
+    """Exact cosine retrieval over a single-modality store, serialized like /search."""
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{kind} index not initialized (set OMURA_{kind.upper()}_BACKEND and build the index).",
+        )
+    if qemb is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{kind} embedding model not ready yet.",
+        )
+    qvec = np.asarray(qemb, dtype=np.float32).flatten()
+    n = float(np.linalg.norm(qvec))
+    if n <= 0:
+        raise HTTPException(status_code=503, detail="Query embedding has zero norm.")
+    qvec = qvec / n
+
+    raw = store.search(qvec, top_k=max(int(top_k) * 4, int(top_k)), kind_filter=None)
+    # Build the candidate list (over-fetched ×4 so the precheck can drop broken ones).
+    candidates: List[Dict[str, Any]] = []
+    for meta, sim in raw:
+        if not isinstance(meta, dict):
+            continue
+        if exclude_nsfw and meta.get("is_nsfw"):
+            continue
+        sim_f = float(sim)
+        candidates.append({
+            "blob_id": meta.get("blob_id"),
+            # Cosine in CLAP/IV2 joint spaces is modest in magnitude; scale into a
+            # readable 0-100 score (clamped) without manufacturing ties.
+            "score": round(max(0.0, min(1.0, (sim_f + 1.0) / 2.0)) * 100.0, 1),
+            "distance": round(1.0 - sim_f, 4),
+            **meta,
+        })
+
+    # Precheck: probe candidate blobs and drop the ones the aggregator can't serve (404),
+    # so the portal never receives a broken blob. Broken ids are pruned in the background.
+    broken: List[str] = []
+    if _SEARCH_PRECHECK and candidates:
+        from concurrent.futures import ThreadPoolExecutor
+        bids = [c["blob_id"] for c in candidates]
+        with ThreadPoolExecutor(max_workers=min(16, len(bids))) as ex:
+            statuses = dict(zip(bids, ex.map(_probe_blob_status, bids)))
+        broken = [b for b, s in statuses.items() if s == 404]
+        if broken:
+            bset = set(broken)
+            candidates = [c for c in candidates if c["blob_id"] not in bset]
+            threading.Thread(
+                target=_prune_broken_modality_blobs, args=(store, broken), daemon=True
+            ).start()
+
+    results = candidates[: int(top_k)]
+    return SearchResponse(results=results, total=len(results))
+
+
 # Max bytes for reverse-image upload (default 25 MiB)
 _REVERSE_IMAGE_MAX_BYTES = int(
     os.getenv("OMURA_REVERSE_IMAGE_MAX_BYTES", str(25 * 1024 * 1024))
 )
+
+
+def _soft_rerank(
+    candidates: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """Conservative multi-signal reranker + optional MMR dedup tail.
+
+    Penalties (multiplicative on base similarity):
+      - NSFW tag-score normalized [0,1] × RERANK_W_NSFW_PENALTY
+      - **NFT/avatar P(NFT|image) × RERANK_W_NFT_PENALTY** (zero-shot CLIP softmax)
+      - Repeated parent_quilt_id × RERANK_W_DUPE_PENALTY (per duplicate)
+      - size < 10 KB × RERANK_W_TINY_PENALTY (thumbnail/broken)
+
+    Boosts:
+      - first_seen_at within last 24h × RERANK_W_RECENT_BOOST
+
+    The top ``RERANK_PRESERVE_TOP_N`` similarity hits are *never* demoted. After the
+    soft pass, if ``RERANK_MMR_AFTER_SOFT`` is on, a greedy MMR pass on the stored
+    image embeddings deduplicates near-identical results (e.g. the same wizard-cat
+    appearing 3× from a Quilt-Inscriptions style collection).
+
+    Each result is annotated with ``rerank_score`` (0-100) and ``rerank_signals``.
+    """
+    from omura.utils.nft_detector import nft_probability
+    import time as _t
+    from datetime import datetime, timezone
+
+    if not candidates:
+        return []
+
+    now_ts = _t.time()
+    seen_quilts: Dict[str, int] = {}
+
+    out: List[Dict[str, Any]] = []
+    for c in candidates:
+        # Use raw cosine similarity (_sim) when available; it's stored as [0,1] and
+        # provides proper differentiation between results.  The legacy `score` field
+        # is capped at 100 (score = min(cosine_sim * 1000, 100)) which collapses
+        # almost all results to 1.0 and destroys the similarity ranking.
+        raw_sim = c.get("_sim")
+        if isinstance(raw_sim, (int, float)):
+            sim_norm = max(float(raw_sim), 0.0)
+        else:
+            sim_norm = float(c.get("score", 0.0)) / 100.0
+        signals = {"base_sim": round(sim_norm, 4)}
+
+        # NSFW penalty
+        nsfw_score = c.get("nsfw_tag_score")
+        nsfw_penalty = 0.0
+        if isinstance(nsfw_score, (int, float)):
+            nsfw_penalty = (float(nsfw_score) / 100.0) * RERANK_W_NSFW_PENALTY
+        elif c.get("is_nsfw"):
+            nsfw_penalty = RERANK_W_NSFW_PENALTY
+        signals["nsfw_penalty"] = round(nsfw_penalty, 3)
+
+        # NFT/avatar penalty — zero-shot CLIP text-anchor softmax.
+        # Requires the candidate to have its stored embedding attached as ``_embedding``;
+        # the search loop already provides it when soft rerank is on.
+        nft_penalty = 0.0
+        nft_p: Optional[float] = None
+        emb = c.get("_embedding")
+        if isinstance(emb, np.ndarray) and RERANK_W_NFT_PENALTY > 0:
+            try:
+                nft_p = nft_probability(emb)
+                if nft_p is not None:
+                    nft_penalty = float(nft_p) * RERANK_W_NFT_PENALTY
+            except Exception:
+                nft_p = None
+        if nft_p is not None:
+            signals["nft_prob"] = round(nft_p, 3)
+            c["nft_score"] = round(nft_p, 4)
+        signals["nft_penalty"] = round(nft_penalty, 3)
+
+        # Duplicate-quilt penalty (escalates per repeat)
+        quilt = c.get("parent_quilt_id")
+        dupe_penalty = 0.0
+        if quilt:
+            seen_count = seen_quilts.get(quilt, 0)
+            dupe_penalty = RERANK_W_DUPE_PENALTY * seen_count  # 0 on first, full on second, etc.
+            seen_quilts[quilt] = seen_count + 1
+        signals["dupe_penalty"] = round(dupe_penalty, 3)
+
+        # Size sanity (tiny = probably thumbnail or corrupt)
+        size = c.get("size") or 0
+        tiny_penalty = 0.0
+        if isinstance(size, int) and 0 < size < 10240:
+            tiny_penalty = RERANK_W_TINY_PENALTY
+        signals["tiny_penalty"] = round(tiny_penalty, 3)
+
+        # Recency boost
+        recent_boost = 0.0
+        first_seen = c.get("first_seen_at")
+        if isinstance(first_seen, str):
+            try:
+                fs = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
+                if fs.tzinfo is None:
+                    fs = fs.replace(tzinfo=timezone.utc)
+                age_h = (datetime.now(timezone.utc) - fs).total_seconds() / 3600.0
+                if age_h < 24:
+                    recent_boost = RERANK_W_RECENT_BOOST * (1.0 - age_h / 24.0)
+            except (ValueError, TypeError):
+                pass
+        signals["recent_boost"] = round(recent_boost, 3)
+
+        rerank = sim_norm * RERANK_W_SIM * (
+            1.0 + recent_boost - nsfw_penalty - nft_penalty - dupe_penalty - tiny_penalty
+        )
+        c["rerank_score"] = round(rerank * 100.0, 2)
+        c["rerank_signals"] = signals
+        out.append(c)
+
+    # Sort by rerank_score, but preserve the top-N from the original similarity order.
+    if RERANK_PRESERVE_TOP_N > 0 and len(out) > RERANK_PRESERVE_TOP_N:
+        preserved = out[: RERANK_PRESERVE_TOP_N]
+        rest_sorted = sorted(out[RERANK_PRESERVE_TOP_N:], key=lambda x: x["rerank_score"], reverse=True)
+        ranked = preserved + rest_sorted
+    else:
+        ranked = sorted(out, key=lambda x: x["rerank_score"], reverse=True)
+
+    # Optional MMR dedup pass — greedy pick on rerank_score minus max-similarity-to-already-picked.
+    if RERANK_MMR_AFTER_SOFT and len(ranked) > top_k:
+        lam = RERANK_MMR_AFTER_LAMBDA
+        selected: List[Dict[str, Any]] = []
+        pool = list(ranked)
+        while pool and len(selected) < int(top_k):
+            if not selected:
+                pick = pool[0]
+            else:
+                best, best_v = None, -1e9
+                sel_embs = [s.get("_embedding") for s in selected if isinstance(s.get("_embedding"), np.ndarray)]
+                for r in pool:
+                    rs = float(r.get("rerank_score", 0.0)) / 100.0
+                    re = r.get("_embedding")
+                    if sel_embs and isinstance(re, np.ndarray):
+                        sims = [float(np.dot(re, s)) for s in sel_embs]
+                        max_sim = max(sims) if sims else 0.0
+                    else:
+                        max_sim = 0.0
+                    v = lam * rs - (1.0 - lam) * max_sim
+                    if v > best_v:
+                        best_v, best = v, r
+                pick = best if best is not None else pool[0]
+            selected.append(pick)
+            pool.remove(pick)
+        final = selected
+    else:
+        final = ranked[: int(top_k)]
+
+    # Strip internal helpers before returning (avoid leaking np arrays in the API response)
+    for r in final:
+        r.pop("_embedding", None)
+        r.pop("_sim", None)
+    return final
+
+
+def _mmr_rerank(
+    candidates: List[Dict[str, Any]],
+    top_k: int,
+    lam: float = RERANK_MMR_LAMBDA,
+    same_quilt_penalty: float = RERANK_SAME_QUILT_PENALTY,
+) -> List[Dict[str, Any]]:
+    """Maximal Marginal Relevance reranking with same-quilt penalty.
+
+    Each candidate must carry ``_embedding`` (np.ndarray) and ``_sim`` (float) keys; both
+    are stripped from the returned dicts. Diversity term is the max cosine similarity
+    against already-selected items, plus an additive bump when the candidate shares a
+    ``parent_quilt_id`` with any selected item (this is what breaks up NFT-collection
+    clustering, since NFTs in a collection are stored as patches of the same quilt).
+    """
+    if not candidates:
+        return []
+    if lam >= 1.0 - 1e-9:
+        # No diversity wanted — just take the top-K by similarity
+        out: List[Dict[str, Any]] = []
+        for c in candidates[:top_k]:
+            c.pop("_embedding", None)
+            c.pop("_sim", None)
+            out.append(c)
+        return out
+
+    selected: List[Dict[str, Any]] = []
+    selected_embs: List[np.ndarray] = []
+    selected_quilts: set = set()
+    remaining = list(candidates)
+
+    while remaining and len(selected) < top_k:
+        best_idx = -1
+        best_score = -float("inf")
+        for i, c in enumerate(remaining):
+            sim_q = float(c.get("_sim", 0.0))
+            if selected_embs:
+                emb = c.get("_embedding")
+                if emb is not None and isinstance(emb, np.ndarray):
+                    sims = np.dot(np.stack(selected_embs), emb)
+                    div = float(np.max(sims))
+                else:
+                    div = 0.0
+                quilt = c.get("parent_quilt_id")
+                if quilt and quilt in selected_quilts:
+                    div += same_quilt_penalty
+            else:
+                div = 0.0
+            mmr = lam * sim_q - (1.0 - lam) * div
+            if mmr > best_score:
+                best_score = mmr
+                best_idx = i
+        if best_idx < 0:
+            break
+        picked = remaining.pop(best_idx)
+        emb = picked.pop("_embedding", None)
+        picked.pop("_sim", None)
+        if isinstance(emb, np.ndarray):
+            selected_embs.append(emb)
+        q = picked.get("parent_quilt_id")
+        if q:
+            selected_quilts.add(q)
+        selected.append(picked)
+    return selected
+
+
+def _cluster_rerank(
+    candidates: List[Dict[str, Any]],
+    top_k: int,
+    k_mult: float = RERANK_CLUSTER_K_MULT,
+) -> List[Dict[str, Any]]:
+    """Cluster candidates by embedding, return one representative per cluster.
+
+    Steps:
+      1. KMeans over candidate embeddings with k = round(top_k * k_mult).
+      2. Score each cluster as Σ similarities of its members → ``cluster_rank``.
+      3. Pick the highest-sim member from each cluster, in cluster_rank order, until
+         top_k is filled. If clusters are exhausted (fewer clusters than top_k), fill
+         remaining slots from each cluster's 2nd-best, 3rd-best, etc.
+
+    Annotates each returned dict with ``cluster_id`` (0-indexed, query-local) and
+    ``cluster_rank`` (1-indexed, smaller = more relevant cluster).
+    """
+    if not candidates:
+        return []
+    if len(candidates) <= top_k:
+        for i, c in enumerate(candidates):
+            c.pop("_embedding", None)
+            c.pop("_sim", None)
+            c["cluster_id"] = i
+            c["cluster_rank"] = i + 1
+        return candidates
+
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+    except ImportError:
+        # Gracefully degrade to pure top-k by similarity if sklearn missing.
+        out: List[Dict[str, Any]] = []
+        for c in candidates[:top_k]:
+            c.pop("_embedding", None)
+            c.pop("_sim", None)
+            out.append(c)
+        return out
+
+    embs = []
+    valid: List[Dict[str, Any]] = []
+    for c in candidates:
+        e = c.get("_embedding")
+        if isinstance(e, np.ndarray):
+            embs.append(e)
+            valid.append(c)
+    if len(valid) <= top_k:
+        for i, c in enumerate(valid):
+            c.pop("_embedding", None)
+            c.pop("_sim", None)
+            c["cluster_id"] = i
+            c["cluster_rank"] = i + 1
+        return valid
+
+    n_clusters = max(2, min(int(round(top_k * k_mult)), len(valid)))
+    X = np.vstack(embs).astype(np.float32)
+    try:
+        km = MiniBatchKMeans(
+            n_clusters=n_clusters,
+            random_state=42,
+            n_init=3,
+            batch_size=min(256, len(valid)),
+            max_iter=50,
+        )
+        labels = km.fit_predict(X)
+    except Exception as exc:
+        print(f"[Search] cluster rerank failed ({exc}); returning top-k by similarity")
+        out = []
+        for c in valid[:top_k]:
+            c.pop("_embedding", None)
+            c.pop("_sim", None)
+            out.append(c)
+        return out
+
+    # Group candidates by cluster, each sorted by similarity desc.
+    by_cluster: Dict[int, List[Dict[str, Any]]] = {}
+    for c, lab in zip(valid, labels):
+        by_cluster.setdefault(int(lab), []).append(c)
+    for lst in by_cluster.values():
+        lst.sort(key=lambda x: float(x.get("_sim", 0.0)), reverse=True)
+
+    # Rank clusters by sum of member similarities (most relevant cluster first).
+    cluster_scores = {
+        cid: float(sum(float(x.get("_sim", 0.0)) for x in members))
+        for cid, members in by_cluster.items()
+    }
+    ranked_clusters = sorted(cluster_scores.keys(), key=lambda c: cluster_scores[c], reverse=True)
+    cluster_rank_map = {cid: i + 1 for i, cid in enumerate(ranked_clusters)}
+
+    # Round-robin: take best member from each cluster in rank order, then 2nd-best, etc.
+    selected: List[Dict[str, Any]] = []
+    indices = {cid: 0 for cid in ranked_clusters}
+    while len(selected) < top_k:
+        progress = False
+        for cid in ranked_clusters:
+            if len(selected) >= top_k:
+                break
+            members = by_cluster[cid]
+            idx = indices[cid]
+            if idx >= len(members):
+                continue
+            picked = members[idx]
+            indices[cid] = idx + 1
+            picked.pop("_embedding", None)
+            picked.pop("_sim", None)
+            picked["cluster_id"] = cid
+            picked["cluster_rank"] = cluster_rank_map[cid]
+            selected.append(picked)
+            progress = True
+        if not progress:
+            break
+
+    return selected
 
 
 def _similar_images_from_embedding(
@@ -347,8 +892,16 @@ def _similar_images_from_embedding(
     top_k: int,
     exclude_blob_id: Optional[str] = None,
     exclude_nsfw: bool = True,
+    text_query: Optional[str] = None,
+    query_kind: str = "text",
 ) -> SearchResponse:
-    """Run cosine retrieval using vector-store index (legacy-compatible path)."""
+    """Run cosine retrieval using vector-store index (legacy-compatible path).
+
+    ``query_kind`` ("text" or "image") only affects the similarity→score scale
+    so cross-modal (text) and same-modal (reverse-image) queries both anchor a
+    strong match near 100. The candidate set, ranking, NSFW handling and
+    response shape are identical for both, keeping the two endpoints 1-to-1.
+    """
     qvec = np.asarray(qemb, dtype=np.float32).flatten()
     qnorm = float(np.linalg.norm(qvec))
     if qnorm <= 0:
@@ -359,47 +912,217 @@ def _similar_images_from_embedding(
     qvec = qvec / qnorm
 
     # Over-fetch then apply exclusions (nsfw/blob id) while preserving rank quality.
-    overfetch_k = max(int(top_k) * 20, int(top_k))
+    # Cluster rerank needs more candidates to form meaningful clusters.
+    overfetch_mult = (
+        max(20, RERANK_CLUSTER_OVERFETCH_MULT) if RERANK_CLUSTER_ENABLED else 20
+    )
+    overfetch_k = max(int(top_k) * overfetch_mult, int(top_k))
     raw_results = store.search(qvec, top_k=overfetch_k, kind_filter="image")
     nsfw_vecs = get_nsfw_embeddings() or []
 
-    results = []
+    # 1. Gather vector candidate IDs
+    vec_ids = []
+    for meta, _ in raw_results:
+        if isinstance(meta, dict) and meta.get("blob_id"):
+            vec_ids.append(meta["blob_id"])
+
+    # 2. Gather text candidate (FTS5 BM25) IDs — only when hybrid FTS is enabled.
+    # Off by default so search ranks purely by embedding similarity (noisy captions
+    # otherwise inflate keyword matches); see HYBRID_FTS_ENABLED.
+    fts_results = []
+    if HYBRID_FTS_ENABLED and text_query:
+        cleaned_q = "".join(c if c.isalnum() or c.isspace() else " " for c in text_query).strip()
+        if cleaned_q:
+            tokens = [t for t in cleaned_q.split() if t]
+            if tokens:
+                match_expr = " AND ".join(tokens)
+                try:
+                    with sqlite3.connect(str(CATALOG_DB_PATH), timeout=10) as conn:
+                        conn.row_factory = sqlite3.Row
+                        cur = conn.execute(
+                            """
+                            SELECT b.*, bm25(blobs_fts) AS bm25_score
+                            FROM blobs_fts f
+                            JOIN blobs b ON f.blob_id = b.blob_id
+                            WHERE blobs_fts MATCH ? AND b.is_active = 1 AND (b.kind = 'image' OR b.mime_type LIKE 'image/%')
+                            ORDER BY bm25_score ASC
+                            LIMIT ?
+                            """,
+                            (match_expr, overfetch_k)
+                        )
+                        fts_results = [dict(row) for row in cur.fetchall()]
+                except Exception as e:
+                    print(f"[Search] FTS5 search error: {e}")
+
+    fts_ids = [r["blob_id"] for r in fts_results if r.get("blob_id")]
+
+    # Map details and compute similarities for hybrid candidate list
+    candidate_details = {}
     for meta, sim in raw_results:
-        if not isinstance(meta, dict):
+        if isinstance(meta, dict) and meta.get("blob_id"):
+            bid = meta["blob_id"]
+            candidate_details[bid] = (dict(meta), float(sim))
+
+    for r in fts_results:
+        bid = r["blob_id"]
+        if bid not in candidate_details:
+            emb = store.get_embedding(bid)
+            if emb is not None:
+                sim = float(np.dot(qvec, emb.flatten() / np.linalg.norm(emb)))
+            else:
+                sim = 0.0
+            meta_cleaned = {
+                "blob_id": r["blob_id"],
+                "mime_type": r["mime_type"],
+                "extension": r["extension"],
+                "kind": r["kind"],
+                "size": r["size"],
+                "is_nsfw": bool(r["is_nsfw"]),
+                "first_seen_at": r["first_seen_at"],
+                "owner": r.get("owner"),
+                "caption": r.get("caption"),
+            }
+            candidate_details[bid] = (meta_cleaned, sim)
+        else:
+            meta, sim = candidate_details[bid]
+            meta["caption"] = r.get("caption")
+
+    # Combine rankings using RRF
+    k = 60
+    rrf_scores = {}
+    all_bids = set(vec_ids + fts_ids)
+
+    for idx, bid in enumerate(vec_ids):
+        rrf_scores[bid] = rrf_scores.get(bid, 0.0) + 1.0 / (k + idx + 1)
+
+    for idx, bid in enumerate(fts_ids):
+        rrf_scores[bid] = rrf_scores.get(bid, 0.0) + 1.0 / (k + idx + 1)
+
+    # FTS rank (best = 0) per blob, used to give genuine text matches a score floor.
+    fts_rank = {bid: idx for idx, bid in enumerate(fts_ids)}
+
+    sorted_bids = sorted(all_bids, key=lambda x: rrf_scores.get(x, 0.0), reverse=True)
+
+    candidates: List[Dict[str, Any]] = []
+    for bid in sorted_bids:
+        if exclude_blob_id and bid == exclude_blob_id:
             continue
-        blob_id = meta.get("blob_id")
-        if not blob_id:
-            continue
-        if exclude_blob_id and blob_id == exclude_blob_id:
-            continue
+
+        meta, sim = candidate_details[bid]
+
+        # Hybrid scoring: ``sim`` stays the true cosine similarity (used for vector
+        # ranking + diversity). For the user-visible ``score`` we additionally floor
+        # text/FTS hits by a text-relevance value (below), so a strong caption match
+        # whose cross-modal cosine is naturally low doesn't show a near-zero score and
+        # then drag every result beneath it down via the monotonic clamp — the old
+        # "hybrid scores look random" symptom.
+
+        emb = (
+            store.get_embedding(bid)
+            if (nsfw_vecs or RERANK_MMR_ENABLED or RERANK_CLUSTER_ENABLED or RERANK_SOFT_ENABLED)
+            else None
+        )
 
         # Result-time NSFW fallback: same 0–100 tag score as indexing (score > min, default 85).
         is_nsfw = bool(meta.get("is_nsfw", False))
         nsfw_tag_score = None
-        if nsfw_vecs:
-            emb = store.get_embedding(blob_id)
-            if emb is not None:
-                nsfw_tag_score = float(nsfw_similarity_score_0_100(emb, nsfw_vecs))
-                if not is_nsfw and is_nsfw_from_tag_score(nsfw_tag_score):
-                    is_nsfw = True
+        if nsfw_vecs and emb is not None:
+            nsfw_tag_score = float(nsfw_similarity_score_0_100(emb, nsfw_vecs))
+            if not is_nsfw and is_nsfw_from_tag_score(nsfw_tag_score):
+                is_nsfw = True
 
         if exclude_nsfw and is_nsfw:
             continue
 
-        # Match legacy score: max(0, sim) * 1000, capped at 100 (0-100 scale).
-        score = float(min(max(float(sim), 0.0) * 1000.0, 100.0))
-        # Keep a distance-like field for compatibility (cosine distance proxy).
+        # Ranking similarity = cosine, floored by FTS text-relevance for caption hits
+        # so vector and text matches live on one scale. This single value drives both
+        # the reranker and the displayed score, so order and percentage never diverge.
+        rank_sim = max(float(sim), 0.0)
+        if bid in fts_rank:
+            fts_sim = max(0.0, FTS_SIM_TOP - FTS_SIM_DECAY * fts_rank[bid])
+            rank_sim = max(rank_sim, fts_sim)
+
+        # Map similarity → 0-100 using a modality-aware multiplier (cross-modal text
+        # vs same-modal image); see get_score_multiplier for why these differ.
+        from omura.utils.imagebind_embeddings import get_score_multiplier
+        multiplier = get_score_multiplier(query_kind)
+        score = float(min(rank_sim * multiplier, 100.0))
         dist = float(1.0 - float(sim))
-        out = {"blob_id": blob_id, "score": score, "distance": dist, **meta}
+        out = {"blob_id": bid, "score": score, "distance": dist, **meta}
         out["is_nsfw"] = is_nsfw
         if nsfw_tag_score is not None:
             out["nsfw_tag_score"] = nsfw_tag_score
         if is_nsfw and not out.get("categories"):
             out["categories"] = ["nsfw", "pornographic"]
             out["category_confidence"] = out.get("category_confidence") or "low"
-        results.append(out)
-        if len(results) >= int(top_k):
-            break
+
+        if RERANK_MMR_ENABLED or RERANK_CLUSTER_ENABLED or RERANK_SOFT_ENABLED:
+            # Normalize embeddings to unit norm; soft rerank uses them for NFT + MMR dedup.
+            if isinstance(emb, np.ndarray):
+                e = np.asarray(emb, dtype=np.float32).flatten()
+                n = float(np.linalg.norm(e))
+                if n > 0:
+                    out["_embedding"] = e / n
+            # Rank by the hybrid similarity (cosine floored by FTS relevance) so the
+            # reranker's order matches the displayed score; the diversity/dedup terms
+            # use ``_embedding`` (true cosine geometry), not this value.
+            out["_sim"] = float(rank_sim)
+        candidates.append(out)
+
+    # Reranker priority: cluster (hard diversity) > MMR (greedy diversity) > soft
+    # (multi-signal, top-N preserved). All default off except soft.
+    if RERANK_CLUSTER_ENABLED:
+        results = _cluster_rerank(candidates, top_k=int(top_k))
+    elif RERANK_MMR_ENABLED:
+        results = _mmr_rerank(candidates, top_k=int(top_k))
+    elif RERANK_SOFT_ENABLED:
+        results = _soft_rerank(candidates, top_k=int(top_k))
+    else:
+        results = candidates[: int(top_k)]
+        # Rerankers strip these internally; the no-rerank path must too so the
+        # response never leaks np arrays / raw sims (keeps both endpoints 1-to-1).
+        for r in results:
+            if isinstance(r, dict):
+                r.pop("_embedding", None)
+                r.pop("_sim", None)
+
+    # The displayed score must track the order the user actually sees. RRF fusion and
+    # the rerankers (cluster/MMR/soft) reorder results for relevance/diversity, so a
+    # later item can carry a higher raw score than an earlier one. The old fix clamped
+    # each score down to the running minimum — but that *manufactures ties*, collapsing
+    # whole runs to one value ("why are so many cats at 74%?"). Instead, keep the real
+    # set of computed score values and assign them in descending order to the final
+    # ranked items: monotonic with the displayed order, no fake ties, magnitudes (and
+    # thus a strong top match near 100) preserved, and lower ranks stay differentiated.
+    score_items = [r for r in results if isinstance(r, dict)]
+    sorted_scores = sorted(
+        (float(r.get("score", 0.0) or 0.0) for r in score_items), reverse=True
+    )
+    for r, s in zip(score_items, sorted_scores):
+        r["score"] = round(s, 1)
+
+    # Caption enrichment (display only): the vector-store metadata has no caption, so
+    # without the FTS join results would show blank captions. Fill them from the catalog
+    # for the final top_k only — purely informational, never used for ranking. Applies to
+    # both text and reverse-image, keeping the two responses 1-to-1.
+    missing = [r["blob_id"] for r in score_items
+               if r.get("blob_id") and not r.get("caption")]
+    if missing and CATALOG_DB_PATH.exists():
+        try:
+            with sqlite3.connect(str(CATALOG_DB_PATH), timeout=10) as conn:
+                ph = ",".join("?" * len(missing))
+                cap_map = {
+                    row[0]: row[1]
+                    for row in conn.execute(
+                        f"SELECT blob_id, caption FROM blobs WHERE blob_id IN ({ph})",
+                        missing,
+                    )
+                }
+            for r in score_items:
+                if not r.get("caption") and cap_map.get(r["blob_id"]):
+                    r["caption"] = cap_map[r["blob_id"]]
+        except Exception as e:
+            print(f"[Search] caption enrichment failed: {e}")
 
     return SearchResponse(results=results, total=len(results))
 
@@ -477,6 +1200,89 @@ async def search(
         qemb,
         top_k=int(payload.top_k),
         exclude_nsfw=bool(payload.exclude_nsfw),
+        text_query=q,
+    )
+
+
+@router.post(
+    "/audio",
+    response_model=SearchResponse,
+    summary="Audio search (text → audio via CLAP)",
+    description="Text-to-audio retrieval over the active-audio catalog using CLAP (laion/larger_clap_general).",
+)
+async def search_audio(payload: SearchRequest):
+    """Search active audio blobs by a text query in the CLAP joint space."""
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Field 'query' is required.")
+    from omura.utils import clap_embeddings as clap
+
+    # Run the (synchronous) embed + FAISS search off the event loop so concurrent
+    # requests and /health don't block on each other.
+    def _run():
+        qemb = clap.embed_text(q)
+        return _modality_search(
+            _shared_audio_vector_store, qemb, top_k=int(payload.top_k),
+            kind="audio", exclude_nsfw=bool(payload.exclude_nsfw),
+        )
+    return await run_in_threadpool(_run)
+
+
+@router.post(
+    "/video",
+    response_model=SearchResponse,
+    summary="Video search (text → video via omura-embed-video)",
+    description="Text-to-video retrieval over the active-video catalog using the finetuned InternVideo2 model.",
+)
+async def search_video(payload: SearchRequest):
+    """Search active video blobs by a text query in the omura-embed-video space."""
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Field 'query' is required.")
+    def _run():
+        try:
+            from omura.utils import video_embeddings as videoemb
+            qemb = videoemb.embed_text(q)
+        except Exception:
+            qemb = None
+        return _modality_search(
+            _shared_video_vector_store, qemb, top_k=int(payload.top_k),
+            kind="video", exclude_nsfw=bool(payload.exclude_nsfw),
+        )
+    return await run_in_threadpool(_run)
+
+
+@router.post(
+    "/video/in-video",
+    response_model=InVideoSearchResponse,
+    summary="Search inside a video (text → timestamp / seek-to-timestamp)",
+    description=(
+        "Temporal localization within a single video: given a `blob_id` and a text `query`, "
+        "returns ranked time `segments` ([{start, end, score}] in seconds) marking where the "
+        "query content appears, so the portal can seek the player to that moment. Uses the "
+        "precomputed temporal index when available, else localizes on-demand."
+    ),
+)
+async def search_in_video(payload: InVideoSearchRequest):
+    blob_id = (payload.blob_id or "").strip()
+    q = (payload.query or "").strip()
+    if not blob_id or not q:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Fields 'blob_id' and 'query' are required.")
+    from omura.utils import video_embeddings as videoemb
+    out = videoemb.search_in_video(
+        blob_id, q, top_k=int(payload.top_k),
+        win_sec=float(payload.win_sec), stride_sec=float(payload.stride_sec),
+    )
+    if out is None:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="video temporal service unavailable")
+    from urllib.parse import quote
+    return InVideoSearchResponse(
+        blob_id=blob_id, query=q,
+        duration=out.get("duration"), source=out.get("source"),
+        blob_url=f"/blob/{quote(blob_id, safe='')}",
+        segments=out.get("segments", []),
     )
 
 
@@ -489,7 +1295,7 @@ async def search(
         "Reads from `blob_catalog.sqlite` and falls back gracefully if in-memory state is not ready."
     ),
 )
-async def media_counters_dashboard() -> MediaBlobCounterResponse:
+def media_counters_dashboard() -> MediaBlobCounterResponse:
     store: Optional[VectorStore] = None
     try:
         store = get_vector_store()
@@ -498,22 +1304,25 @@ async def media_counters_dashboard() -> MediaBlobCounterResponse:
     catalog_db_path = getattr(store, "catalog_db_path", CATALOG_DB_PATH)
 
     try:
-        epoch = get_current_epoch(silent=True)
-        current_epoch = MANUAL_EPOCH if epoch is None else int(epoch)
+        current_epoch = get_current_epoch(silent=True)
     except Exception:
-        current_epoch = MANUAL_EPOCH
+        current_epoch = 0
 
     if catalog_db_path.exists():
         try:
             stats = _sql_dashboard_counts(str(catalog_db_path), current_epoch)
             active = stats["counts_active"]  # type: ignore[index]
+            # Both modality_counts_all and modality_counts_active surface to the
+            # dashboard; keep them on the same (active) denominator so the top
+            # counters and the per-modality bars don't disagree. The all-vs-active
+            # split is still queryable from counts_all if needed downstream.
             return MediaBlobCounterResponse(
                 total_blobs=int(stats["total_blobs"]),  # type: ignore[arg-type]
                 active_blobs=int(stats["active_blobs"]),  # type: ignore[arg-type]
                 identified_image=int(active.get("image", 0)),
                 identified_video=int(active.get("video", 0)),
                 identified_audio=int(active.get("audio", 0)),
-                modality_counts_all=stats["counts_all"],  # type: ignore[arg-type]
+                modality_counts_all=active,  # type: ignore[arg-type]
                 modality_counts_active=active,  # type: ignore[arg-type]
             )
         except Exception as e:
@@ -627,8 +1436,10 @@ async def classifier_counts_dashboard() -> ClassifierDashboardResponse:
     if sum(int(v) for v in categories_out.values()) == 0:
         # Last-resort fallback with no live store data.
         try:
-            epoch = get_current_epoch(silent=True)
-            current_epoch = MANUAL_EPOCH if epoch is None else int(epoch)
+            current_epoch = get_current_epoch(silent=True)
+        except Exception:
+            current_epoch = 0
+        try:
             if CATALOG_DB_PATH.exists():
                 db_idx = _sql_indexed_counts(str(CATALOG_DB_PATH), current_epoch)
                 categories_out["other"] = int(db_idx.get("by_kind", {}).get("image", 0))
@@ -998,13 +1809,84 @@ async def rebuild_nsfw_classifier(
     )
 
 
+def _fetch_blob_bytes(blob_id: str, timeout: int = 30) -> Optional[bytes]:
+    """Fetch raw bytes of an indexed blob (plain or quilt-patch) via the aggregator pool."""
+    from omura.utils.aggregator_pool import get_pool
+    import requests as _rq
+    if "::" in blob_id:
+        quilt, ident = blob_id.split("::", 1)
+        path = f"/v1/blobs/by-quilt-id/{quilt}/{_rq.utils.quote(ident, safe='')}"
+    else:
+        path = f"/v1/blobs/{blob_id}"
+    try:
+        resp, _ = get_pool().get(path, timeout=timeout)
+        if resp is None or resp.status_code != 200:
+            return None
+        return resp.content
+    except Exception:
+        return None
+
+
+def _harden_reverse_results(results: List[Dict[str, Any]], query_bytes: bytes,
+                            verify_top: int = 12) -> Dict[str, Any]:
+    """Confirm exact/near duplicates among the top embedding hits via perceptual hash, and
+    attach provenance. Annotates each verified result with `phash_hamming`,
+    `duplicate_class`, `is_exact_duplicate`. Returns a summary dict."""
+    from concurrent.futures import ThreadPoolExecutor
+    from omura.utils import perceptual_hash as ph
+
+    qhash = ph.dhash(query_bytes)
+    summary = {"query_phash": (f"{qhash:016x}" if qhash is not None else None),
+               "duplicates_found": 0, "exact_duplicate_blob_id": None, "provenance": None}
+    if qhash is None or not results:
+        return summary
+
+    head = results[:verify_top]
+
+    def _verify(r):
+        data = _fetch_blob_bytes(r.get("blob_id", ""))
+        if not data:
+            return
+        h = ph.dhash(data)
+        if h is None:
+            return
+        dist = ph.hamming(qhash, h)
+        r["phash_hamming"] = dist
+        r["duplicate_class"] = ph.classify(dist)
+        r["is_exact_duplicate"] = dist <= ph.EXACT_MAX
+        r["is_near_duplicate"] = dist <= ph.NEAR_MAX
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_verify, head))
+
+    dups = [r for r in head if r.get("is_near_duplicate")]
+    summary["duplicates_found"] = len(dups)
+    exact = next((r for r in head if r.get("is_exact_duplicate")), None)
+    top_dup = exact or (dups[0] if dups else None)
+    if exact:
+        summary["exact_duplicate_blob_id"] = exact.get("blob_id")
+    if top_dup is not None:
+        summary["provenance"] = {
+            "blob_id": top_dup.get("blob_id"),
+            "owner": top_dup.get("owner"),
+            "parent_quilt_id": top_dup.get("parent_quilt_id"),
+            "quilt_identifier": top_dup.get("quilt_identifier"),
+            "duplicate_class": top_dup.get("duplicate_class"),
+            "phash_hamming": top_dup.get("phash_hamming"),
+        }
+    return summary
+
+
 @router.post(
     "/reverse-image",
-    response_model=SearchResponse,
-    summary="Reverse image search",
+    response_model=ReverseImageResponse,
+    summary="Reverse image search (hardened: exact-duplicate + NFT provenance)",
     description=(
-        "Upload an image (`multipart/form-data`, field name: `file`) and return visually similar indexed images.\n"
-        "Optional fields: `top_k` (default 10), `exclude_nsfw` (default true)."
+        "Upload an image (`multipart/form-data`, field name: `file`) and return visually similar "
+        "indexed images. Top hits are confirmed as exact/near duplicates via perceptual hash and "
+        "annotated with `duplicate_class`/`phash_hamming`; a `provenance` block (owner, parent "
+        "quilt) is returned for the strongest duplicate. Fields: `top_k` (default 10), "
+        "`exclude_nsfw` (default true), `verify_duplicates` (default true)."
     ),
     responses={
         200: {"description": "Reverse-image search completed"},
@@ -1018,7 +1900,8 @@ async def reverse_image_search(
     instruction: Optional[str] = Form(None),
     top_k: int = Form(10),
     exclude_nsfw: bool = Form(True),
-) -> SearchResponse:
+    verify_duplicates: bool = Form(True),
+) -> ReverseImageResponse:
     store = get_vector_store()
     image_bytes = await file.read()
     if len(image_bytes) > _REVERSE_IMAGE_MAX_BYTES:
@@ -1034,8 +1917,20 @@ async def reverse_image_search(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Failed to generate embedding for image.",
         )
-    return _similar_images_from_embedding(
-        store, qemb, top_k=top_k, exclude_nsfw=exclude_nsfw
+    base = _similar_images_from_embedding(
+        store, qemb, top_k=top_k, exclude_nsfw=exclude_nsfw, query_kind="image"
+    )
+    results = base.results if hasattr(base, "results") else base.get("results", [])
+    summary = {"query_phash": None, "duplicates_found": 0,
+               "exact_duplicate_blob_id": None, "provenance": None}
+    if verify_duplicates:
+        summary = await run_in_threadpool(_harden_reverse_results, results, image_bytes)
+    return ReverseImageResponse(
+        results=results, total=len(results),
+        query_phash=summary["query_phash"],
+        duplicates_found=summary["duplicates_found"],
+        exact_duplicate_blob_id=summary["exact_duplicate_blob_id"],
+        provenance=summary["provenance"],
     )
 
 
@@ -1089,9 +1984,9 @@ async def get_stats() -> VectorStoreStats:
 
         try:
             epoch = get_current_epoch(silent=True)
-            current_epoch = MANUAL_EPOCH if epoch is None else int(epoch)
+            current_epoch = int(epoch) if epoch is not None else get_current_epoch()
         except Exception:
-            current_epoch = MANUAL_EPOCH
+            current_epoch = get_current_epoch()
 
         db_total = 0
         db_by_kind: Dict[str, int] = {}
@@ -1149,9 +2044,9 @@ async def get_indexer_stats() -> dict:
 
         try:
             epoch = get_current_epoch(silent=True)
-            current_epoch = MANUAL_EPOCH if epoch is None else int(epoch)
+            current_epoch = int(epoch) if epoch is not None else get_current_epoch()
         except Exception:
-            current_epoch = MANUAL_EPOCH
+            current_epoch = get_current_epoch()
 
         if CATALOG_DB_PATH.exists():
             try:

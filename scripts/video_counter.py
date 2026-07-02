@@ -15,7 +15,7 @@ Usage:
   uv run python scripts/video_counter.py --epoch 79 --workers 16 --live
 
 Environment:
-  WALRUS_AGGREGATOR_URL   default: https://walrus-mainnet-aggregator.redundex.com
+  WALRUS_AGGREGATOR_URL   default: https://agrregator.omura.fun
   OMURA_BLOB_DISCOVERY    default: graphql (on-chain end_epoch); set blockberry for faster API
   OMURA_GRAPHQL_PAGE_SIZE objects per GraphQL page (default 50)
   OMURA_GRAPHQL_SLEEP_SEC   pause between pages (default 0.08)
@@ -44,14 +44,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from omura.parsers.file_detection import detect_file_type
 from omura.utils.blockberry import (
-    MANUAL_EPOCH,
     get_blob_details_by_id,
     get_current_epoch,
     is_blob_expired_for_epoch,
 )
 from omura.utils.blob_discovery import get_blob_discovery_source, iter_active_blob_entries
 
-DEFAULT_AGGREGATOR = "https://walrus-mainnet-aggregator.redundex.com"
+DEFAULT_AGGREGATOR = "https://agrregator.omura.fun"
 AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", DEFAULT_AGGREGATOR).rstrip("/")
 
 # Match file_detection: ISO BMFF / EBML / MPEG-TS benefit from ~8KiB; libmagic also uses up to 8KiB
@@ -120,7 +119,7 @@ def main() -> int:
         "--epoch",
         type=int,
         default=None,
-        help="Walrus epoch for active filter (end_epoch > epoch). Default: auto via Blockberry, else MANUAL_EPOCH.",
+        help="Walrus epoch for active filter (end_epoch > epoch). Default: auto via Blockberry.",
     )
     parser.add_argument(
         "--start-page",
@@ -242,7 +241,7 @@ def main() -> int:
         if current_epoch is None:
             current_epoch = get_current_epoch(silent=True)
         if current_epoch is None:
-            current_epoch = MANUAL_EPOCH
+            current_epoch = get_current_epoch()
 
         bb_details, bb_err = get_blob_details_by_id(bid, timeout=args.timeout)
         expired = is_blob_expired_for_epoch(bb_details, current_epoch) if bb_details else None
@@ -373,10 +372,6 @@ def main() -> int:
     current_epoch = args.epoch
     if current_epoch is None:
         current_epoch = get_current_epoch()
-    if current_epoch is None:
-        current_epoch = MANUAL_EPOCH
-        if not args.json:
-            print(f"Using MANUAL_EPOCH={MANUAL_EPOCH} (could not auto-detect).", file=sys.stderr)
 
     counts: Counter[str] = Counter()
     fail_by_kind: Counter[str] = Counter()

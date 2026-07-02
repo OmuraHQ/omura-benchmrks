@@ -29,7 +29,7 @@ TMP_FILE="$(mktemp)"
 trap 'rm -f "${TMP_FILE}"' EXIT
 
 if crontab -l >/dev/null 2>&1; then
-  crontab -l | rg -v "omura-prune-expired-blobs" > "${TMP_FILE}" || true
+  crontab -l | grep -v "omura-prune-expired-blobs" > "${TMP_FILE}" || true
 else
   : > "${TMP_FILE}"
 fi

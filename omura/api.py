@@ -13,9 +13,11 @@ from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from omura.routes import admin as admin_routes
 from omura.routes import blobs, search
 from omura.routes import dashboard as dashboard_routes
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch
+from omura.utils.blockberry import get_current_epoch
+from omura.utils.aggregator_pool import get_pool
 from omura.utils.imagebind_embeddings import initialize_embedding_model
 from omura.utils.vector_store import VectorStore
 
@@ -90,11 +92,18 @@ app.add_middleware(
 app.include_router(search.router)
 app.include_router(blobs.router)
 app.include_router(dashboard_routes.router)
+app.include_router(admin_routes.router)
 
 # Background thread handles
 _cataloger_thread: Optional[threading.Thread] = None
 _indexer_thread: Optional[threading.Thread] = None
+_bellyseal_thread: Optional[threading.Thread] = None
+_walrus_indexer_thread: Optional[threading.Thread] = None
 _save_task: Optional[asyncio.Task] = None
+_expire_flush_task: Optional[asyncio.Task] = None
+
+# Shared lock for all live indexers writing to the same VectorStore
+_live_indexer_store_lock = threading.Lock()
 
 # Global vector store (shared between API and vector indexer)
 _shared_vector_store = None
@@ -168,11 +177,6 @@ async def periodic_save() -> None:
             if now - last_prune_ts >= prune_interval:
                 try:
                     current_epoch = get_current_epoch()
-                    if current_epoch is None:
-                        current_epoch = MANUAL_EPOCH
-                        print(
-                            f"[PeriodicSave] Could not auto-detect epoch; using MANUAL_EPOCH={MANUAL_EPOCH}"
-                        )
 
                     prune_summary = _shared_vector_store.prune_expired(
                         current_epoch=current_epoch, dry_run=False
@@ -232,10 +236,114 @@ async def periodic_save() -> None:
             except asyncio.CancelledError:
                 break
 
+async def daily_expire_flush() -> None:
+    """Daily cron: remove expired Walrus blobs from the vector store + catalog DB.
+
+    Runs once at startup (after a short warm-up) and then every 24 h at midnight UTC.
+    Fetches the current Walrus storage epoch, prunes any blob whose ``expiresAt``
+    metadata is <= current epoch, marks them ``is_active=0`` in the catalog, then
+    saves the updated index without creating a backup.
+
+    Disable via ``OMURA_EXPIRE_FLUSH_ENABLED=false``.
+    Schedule override via ``OMURA_EXPIRE_FLUSH_INTERVAL_SECS`` (default: 86400).
+    """
+    import sqlite3 as _sqlite3
+    from omura.utils.blob_catalog import CATALOG_DB_PATH as _CATALOG_DB_PATH
+
+    enabled = os.getenv("OMURA_EXPIRE_FLUSH_ENABLED", "true").lower() == "true"
+    if not enabled:
+        print("[ExpireFlush] disabled via OMURA_EXPIRE_FLUSH_ENABLED=false")
+        return
+
+    interval = int(os.getenv("OMURA_EXPIRE_FLUSH_INTERVAL_SECS", "86400"))  # 24 h
+
+    # Initial warm-up delay so the store is fully loaded before first prune
+    warmup = int(os.getenv("OMURA_EXPIRE_FLUSH_WARMUP_SECS", "300"))  # 5 min
+    print(f"[ExpireFlush] Scheduled — first run in {warmup}s, then every {interval}s")
+
+    try:
+        await asyncio.sleep(warmup)
+    except asyncio.CancelledError:
+        return
+
+    while True:
+        try:
+            global _shared_vector_store
+            if _shared_vector_store is None or _shared_vector_store.size() == 0:
+                print("[ExpireFlush] Store not ready, skipping this run")
+            else:
+                # 1. Get current Walrus epoch
+                try:
+                    current_epoch = get_current_epoch()
+                except Exception as e:
+                    print(f"[ExpireFlush] Could not fetch epoch: {e} — skipping")
+                    current_epoch = None
+
+                if current_epoch is not None:
+                    print(f"[ExpireFlush] Running — epoch={current_epoch} store_size={_shared_vector_store.size()}")
+
+                    # 2. Prune vector store
+                    summary = _shared_vector_store.prune_expired(
+                        current_epoch=current_epoch, dry_run=False
+                    )
+                    expired_ids = summary.get("expired_count", 0)
+                    print(
+                        f"[ExpireFlush] Pruned {expired_ids} expired blobs "
+                        f"({summary.get('kept_count')} kept)"
+                    )
+
+                    # 3. Mark expired blobs inactive in catalog DB
+                    if expired_ids > 0:
+                        try:
+                            with _sqlite3.connect(str(_CATALOG_DB_PATH), timeout=15) as conn:
+                                conn.execute(
+                                    """
+                                    UPDATE blobs
+                                    SET is_active = 0,
+                                        status = 'expired',
+                                        last_updated_at = datetime('now')
+                                    WHERE CAST(end_epoch AS INTEGER) <= ?
+                                      AND is_active = 1
+                                    """,
+                                    (current_epoch,),
+                                )
+                                affected = conn.execute("SELECT changes()").fetchone()[0]
+                                conn.commit()
+                            print(f"[ExpireFlush] Marked {affected} blobs inactive in catalog")
+                        except Exception as db_err:
+                            print(f"[ExpireFlush] Catalog update error (non-fatal): {db_err}")
+
+                        # 4. Save updated index
+                        try:
+                            _shared_vector_store.save(create_backup=False)
+                            print(f"[ExpireFlush] Index saved — new size: {_shared_vector_store.size()}")
+                        except Exception as save_err:
+                            print(f"[ExpireFlush] Save error (non-fatal): {save_err}")
+
+        except asyncio.CancelledError:
+            print("[ExpireFlush] Shutdown — exiting.")
+            break
+        except Exception as e:
+            print(f"[ExpireFlush] Unexpected error (non-fatal): {e}")
+
+        # Sleep until next run (default: 24 h)
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
 
 def acquire_lock(lock_name: str) -> Optional[object]:
-    """Acquire a file lock to ensure single execution across workers."""
-    lock_file = os.path.join(tempfile.gettempdir(), f"omura_{lock_name}.lock")
+    """Acquire a file lock to ensure single execution across workers.
+
+    OMURA_LOCK_NAMESPACE lets multiple independent instances (e.g. prod + a
+    staging instance on another port) run their own background indexers on the
+    same host without contending for the same /tmp lock. Empty (default) keeps
+    the original ``omura_<name>.lock`` path so existing deployments are unchanged.
+    """
+    ns = os.getenv("OMURA_LOCK_NAMESPACE", "").strip()
+    prefix = f"omura_{ns}_" if ns else "omura_"
+    lock_file = os.path.join(tempfile.gettempdir(), f"{prefix}{lock_name}.lock")
     try:
         fp = open(lock_file, 'w')
         fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -250,8 +358,16 @@ _saver_lock_fp = None
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _cataloger_thread, _indexer_thread, _save_task
+    global _cataloger_thread, _indexer_thread, _save_task, _expire_flush_task
     global _shared_vector_store, _leader_lock_fp, _saver_lock_fp
+
+    # ── Aggregator pool startup ping (background, non-blocking) ──
+    def _ping_pool() -> None:
+        try:
+            get_pool().startup_ping()
+        except Exception as exc:
+            print(f"[API] Aggregator pool ping failed: {exc}")
+    threading.Thread(target=_ping_pool, daemon=True, name="agg-pool-ping").start()
 
     # ── Vector store ──
     print("[API] Initializing vector store...")
@@ -265,6 +381,44 @@ async def startup_event() -> None:
         import traceback
         print(f"[API] Vector store init failed: {e}")
         traceback.print_exc()
+
+    # ── Audio store (CLAP, 512-d) — separate index for text→audio search ──
+    if os.getenv("OMURA_AUDIO_BACKEND", "").strip().lower() == "clap":
+        try:
+            from pathlib import Path as _Path
+            from omura.utils.clap_embeddings import CLAP_DIM
+            audio_dir = _Path(os.getenv("OMURA_AUDIO_VECTOR_STORE_DIR", "data/vector_index_clap"))
+            audio_store = VectorStore(index_path=audio_dir / "vector_index.faiss", embedding_dim=CLAP_DIM)
+            audio_store.load()
+            search.set_shared_audio_vector_store(audio_store)
+            print(f"[API] Audio (CLAP) store: {audio_store.size()} embeddings")
+
+            # Pre-warm the CLAP text encoder in the background so the first /search/audio
+            # query doesn't pay a ~6s cold-start model load.
+            def _warm_clap():
+                try:
+                    from omura.utils import clap_embeddings as _clap
+                    _clap.embed_text("warmup")
+                    print("[API] CLAP text encoder warmed up")
+                except Exception as _e:
+                    print(f"[API] CLAP warmup failed: {_e}")
+            import threading as _t
+            _t.Thread(target=_warm_clap, daemon=True).start()
+        except Exception as e:
+            print(f"[API] Audio store init failed: {e}")
+
+    # ── Video store (omura-embed-video / InternVideo2, 768-d) — text→video search ──
+    if os.getenv("OMURA_VIDEO_BACKEND", "").strip().lower() in ("internvideo2", "omura_embed_video"):
+        try:
+            from pathlib import Path as _Path
+            video_dim = int(os.getenv("OMURA_VIDEO_EMBEDDING_DIM", "768"))
+            video_dir = _Path(os.getenv("OMURA_VIDEO_VECTOR_STORE_DIR", "data/vector_index_iv2"))
+            video_store = VectorStore(index_path=video_dir / "vector_index.faiss", embedding_dim=video_dim)
+            video_store.load()
+            search.set_shared_video_vector_store(video_store)
+            print(f"[API] Video store: {video_store.size()} embeddings")
+        except Exception as e:
+            print(f"[API] Video store init failed: {e}")
 
     # ── Catalog DB ──
     from omura.utils.blob_catalog import init_catalog_db, CATALOG_DB_PATH
@@ -285,11 +439,13 @@ async def startup_event() -> None:
     else:
         print("[API] Embedding model preload skipped for API QoS mode")
 
-    # ── Periodic save (one worker only) ──
+    # ── Periodic save + daily expire flush (one worker only) ──
     _saver_lock_fp = acquire_lock("saver")
     if _saver_lock_fp:
         _save_task = asyncio.create_task(periodic_save())
         print("[API] Periodic save task started")
+        _expire_flush_task = asyncio.create_task(daily_expire_flush())
+        print("[API] Daily expire-flush task scheduled (first run in 5 min)")
     else:
         print("[API] Periodic save: another worker holds lock, skipping")
 
@@ -303,6 +459,22 @@ async def startup_event() -> None:
         if os.getenv("OMURA_ENABLE_INDEXER", "true").lower() == "true":
             _indexer_thread = _start_daemon(_run_vector_indexer, "vector-indexer")
             print("[API] Vector Indexer (Process 2) started")
+
+        if os.getenv("OMURA_BELLYSEAL_ENABLED", "true").lower() == "true":
+            from omura.indexers.bellyseal_indexer import start_bellyseal_indexer_thread
+            _bellyseal_thread = start_bellyseal_indexer_thread(
+                _shared_vector_store, _live_indexer_store_lock
+            )
+            if _bellyseal_thread:
+                print("[API] BellySeal live indexer started")
+
+        if os.getenv("OMURA_WALRUS_INDEXER_ENABLED", "true").lower() == "true":
+            from omura.indexers.walrus_blob_indexer import start_walrus_blob_indexer_thread
+            _walrus_indexer_thread = start_walrus_blob_indexer_thread(
+                _shared_vector_store, _live_indexer_store_lock
+            )
+            if _walrus_indexer_thread:
+                print("[API] Walrus blob indexer started")
     else:
         print("[API] Background processes: another worker is leader, skipping")
 

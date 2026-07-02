@@ -218,7 +218,13 @@ def infer_quilt_layout(blob: bytes) -> Optional[Tuple[int, int, int, int]]:
 
 
 def parse_quilt_patch_blob(raw: bytes) -> Optional[Tuple[str, Dict[str, str], bytes]]:
-    """Parse one patch stream: ``QuiltPatchBlobHeader`` + id + tags + inner file bytes."""
+    """Parse one patch stream: ``QuiltPatchBlobHeader`` + id + tags + inner file bytes.
+
+    NOTE: This local parser does NOT fully match Mysten's wire format and yields
+    truncated identifiers / unaligned content for some quilts. Prefer the aggregator
+    endpoints ``/v1/quilts/{id}/patches`` and ``/v1/blobs/by-quilt-id/{id}/{ident}``
+    (or ``by-quilt-patch-id/{patch_id}``) for production use.
+    """
     if len(raw) < 6:
         return None
     if raw[0] != 1:

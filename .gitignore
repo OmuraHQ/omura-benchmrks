@@ -25,6 +25,10 @@ venv/
 env/
 ENV/
 .venv
+.venv-*
+
+# Cloned upstream repos inside benchmark harnesses (own .git, not a submodule)
+benchmarks/eval/internvideo2/repo/
 
 # IDEs
 .vscode/
@@ -77,3 +81,4 @@ Thumbs.db
 docs/REVENUE_MODEL.md
 docs/TECHNICAL_ARCHITECTURE.md
 docs/USAGE.md
+*.json

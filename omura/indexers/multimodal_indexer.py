@@ -22,12 +22,19 @@ import numpy as np
 import requests
 
 from omura.parsers.file_detection import detect_file_type
-from omura.parsers.multimodal import is_supported_image
+from omura.parsers.multimodal import (
+    is_supported_audio,
+    is_supported_image,
+    is_supported_video,
+)
 from omura.parsers.quilt import iter_quilt_patch_contents
-from omura.utils.blockberry import MANUAL_EPOCH, get_current_epoch
+from omura.utils.aggregator_pool import get_pool
+from omura.utils.blockberry import get_current_epoch
 from omura.utils.blob_discovery import iter_active_blob_entries
 from omura.utils.imagebind_embeddings import (
+    generate_audio_embedding,
     generate_image_embedding,
+    generate_video_embedding,
     get_nsfw_embeddings,
     is_model_ready,
     is_nsfw_from_tag_score,
@@ -54,13 +61,13 @@ REINDEX_IN_PLACE = os.getenv("OMURA_REINDEX_IN_PLACE", "false").lower() == "true
 _EPOCH_CACHE_SEC = float(os.getenv("OMURA_INDEXER_EPOCH_CACHE_SEC", "300"))
 
 # Listen mode
-LISTEN_INTERVAL_SECONDS = int(os.getenv("OMURA_LISTEN_INTERVAL_SECONDS", "60"))
+LISTEN_INTERVAL_SECONDS = int(os.getenv("OMURA_LISTEN_INTERVAL_SECONDS", "10"))
 # Max pages per listen poll (100 blobs/page)
 LISTEN_MAX_PAGES = int(os.getenv("OMURA_LISTEN_MAX_PAGES", "5"))
 # Stop listen poll early after this many consecutive already-indexed blobs
 LISTEN_EARLY_STOP_KNOWN = int(os.getenv("OMURA_LISTEN_EARLY_STOP_KNOWN", "20"))
 
-DEFAULT_AGGREGATOR = "https://walrus-mainnet-aggregator.redundex.com"
+DEFAULT_AGGREGATOR = "https://agrregator.omura.fun"
 AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", DEFAULT_AGGREGATOR).rstrip("/")
 
 # ── HTTP session pool (thread-local, one session per worker thread) ─────────────
@@ -104,8 +111,11 @@ def _get_walrus_epoch() -> int:
             and (now - _cached_walrus_epoch_at) < _EPOCH_CACHE_SEC
         ):
             return _cached_walrus_epoch
-        e = get_current_epoch(silent=True)
-        _cached_walrus_epoch = MANUAL_EPOCH if e is None else e
+        try:
+            _cached_walrus_epoch = get_current_epoch(silent=True)
+        except Exception:
+            if _cached_walrus_epoch is None:
+                _cached_walrus_epoch = 0
         _cached_walrus_epoch_at = now
         return _cached_walrus_epoch
 
@@ -422,55 +432,53 @@ def _upsert_blob_status(
 
 
 def fetch_blob_http(blob_id: str) -> Optional[bytes]:
-    """Fetch blob bytes from the configured Walrus aggregator (thread-safe, pooled)."""
-    url = f"{AGGREGATOR_URL}/v1/blobs/{blob_id}"
-    try:
-        resp = _get_session().get(url, timeout=60)
-        return resp.content if resp.status_code == 200 else None
-    except requests.RequestException:
+    """Fetch blob bytes via the aggregator pool (load-balanced across upstreams)."""
+    resp, _ = get_pool().get(
+        f"/v1/blobs/{blob_id}", session=_get_session(), timeout=60
+    )
+    if resp is None or resp.status_code != 200:
         return None
+    return resp.content
 
 
 def fetch_quilt_patches_by_id(blob_id: str) -> List[Dict[str, str]]:
-    """Fetch quilt patch descriptors from aggregator.
+    """Fetch quilt patch descriptors via the aggregator pool.
 
-    Expected response shape:
-      [{"identifier": "...", "patch_id": "..."}, ...]
+    Endpoint (Walrus aggregator v1.48+): ``GET /v1/quilts/{quilt_id}/patches``.
+    Returns ``[{"identifier": "...", "patch_id": "...", "tags": {...}}, ...]``.
     """
-    url = f"{AGGREGATOR_URL}/v1/quilts/patches-by-id/{blob_id}"
-    try:
-        resp = _get_session().get(url, timeout=60)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        if not isinstance(data, list):
-            return []
-        out: List[Dict[str, str]] = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            ident = item.get("identifier")
-            patch_id = item.get("patch_id")
-            if isinstance(ident, str) and isinstance(patch_id, str):
-                out.append({"identifier": ident, "patch_id": patch_id})
-        return out
-    except Exception:
+    resp, _ = get_pool().get(
+        f"/v1/quilts/{blob_id}/patches", session=_get_session(), timeout=60
+    )
+    if resp is None or resp.status_code != 200:
         return []
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("identifier")
+        patch_id = item.get("patch_id")
+        if isinstance(ident, str) and isinstance(patch_id, str):
+            out.append({"identifier": ident, "patch_id": patch_id})
+    return out
 
 
 def fetch_quilt_blob_by_identifier(quilt_id: str, identifier: str) -> Optional[bytes]:
-    """Fetch one quilt patch content by identifier.
-
-    Endpoint:
-      GET /v1/blobs/by-quilt-id/{quilt_id}/{identifier}
-    """
+    """Fetch one quilt patch content by identifier via the aggregator pool."""
     safe_identifier = requests.utils.quote(identifier, safe="")
-    url = f"{AGGREGATOR_URL}/v1/blobs/by-quilt-id/{quilt_id}/{safe_identifier}"
-    try:
-        resp = _get_session().get(url, timeout=60)
-        return resp.content if resp.status_code == 200 else None
-    except requests.RequestException:
+    resp, _ = get_pool().get(
+        f"/v1/blobs/by-quilt-id/{quilt_id}/{safe_identifier}",
+        session=_get_session(), timeout=60,
+    )
+    if resp is None or resp.status_code != 200:
         return None
+    return resp.content
 
 
 # ── DB helpers (fast lookup + batch writes) ────────────────────────────────────
@@ -582,9 +590,14 @@ def _index_content(
         mime_type, ext, kind = detect_file_type(content)
     size = len(content)
 
-    # Only index images in the vector store
+    # Dispatch by kind. Embedding functions return None when the active model
+    # doesn't support that modality (e.g. Omura-Embed is image+text only).
     if kind == "image" and is_supported_image(ext):
         gen = "image"
+    elif kind == "video" and is_supported_video(ext):
+        gen = "video"
+    elif kind == "audio" and is_supported_audio(ext):
+        gen = "audio"
     else:
         return None
 
@@ -594,6 +607,10 @@ def _index_content(
     try:
         if gen == "image":
             embedding = generate_image_embedding(content, blob_id=blob_id)
+        elif gen == "video":
+            embedding = generate_video_embedding(content, ext, blob_id)
+        elif gen == "audio":
+            embedding = generate_audio_embedding(content, ext, blob_id)
 
         if embedding is not None:
             nsfw_vecs = get_nsfw_embeddings()
@@ -1154,7 +1171,12 @@ def run_indexer_with_stores(
     batch_size: int = BATCH_SIZE,
     max_batches: Optional[int] = None,
 ) -> None:
-    """Entry point: backfill all active blobs, then listen continuously for new ones."""
+    """Entry point: backfill all active blobs, then listen continuously for new ones.
+
+    Also spawns the QuiltExpander background thread which walks every ``kind='quilt'``
+    row in the catalog and identifies inner patches (audio/video by filename, image by
+    fetch + embed). Disable via ``OMURA_EXPAND_QUILTS=false``.
+    """
     global _global_stats
 
     store = vector_stores.get("image") or next(iter(vector_stores.values()))
@@ -1164,6 +1186,26 @@ def run_indexer_with_stores(
 
     with _stats_lock:
         _global_stats = IndexStats.load(stats_path)
+
+    # Background quilt expander: walks every quilt in catalog, records inner patches.
+    try:
+        from omura.indexers.quilt_expander import start_quilt_expander_thread
+        from omura.utils.blob_catalog import CATALOG_DB_PATH
+
+        start_quilt_expander_thread(CATALOG_DB_PATH, store)
+    except Exception as e:
+        print(f"[Indexer] QuiltExpander failed to start (non-fatal): {e}")
+
+    # Real-time Sui event listener: detects new blobs the instant they're certified
+    # on-chain (way faster than the cataloger's polling). Catalog row gets written
+    # within ~2-5s of upload.
+    try:
+        from omura.indexers.sui_event_listener import start_sui_event_listener_thread
+        from omura.utils.blob_catalog import CATALOG_DB_PATH as _CDB
+
+        start_sui_event_listener_thread(_CDB)
+    except Exception as e:
+        print(f"[Indexer] SuiEventListener failed to start (non-fatal): {e}")
 
     if REINDEX_IN_PLACE:
         print(

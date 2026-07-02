@@ -32,6 +32,7 @@ import numpy as np
 import requests
 import requests.adapters
 
+from omura.utils.aggregator_pool import get_pool
 from omura.utils.blob_catalog import (
     CATALOG_DB_PATH,
     dequeue_blobs,
@@ -64,7 +65,7 @@ CLUSTER_INTERVAL = int(os.getenv("OMURA_CLUSTER_INTERVAL_SECONDS", "3600"))  # 1
 N_CLUSTERS = int(os.getenv("OMURA_N_CLUSTERS", "30"))
 MAX_RETRIES = int(os.getenv("OMURA_INDEXER_MAX_RETRIES", "3"))
 
-DEFAULT_AGGREGATOR = "https://walrus-mainnet-aggregator.redundex.com"
+DEFAULT_AGGREGATOR = "https://agrregator.omura.fun"
 AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", DEFAULT_AGGREGATOR).rstrip("/")
 
 # Per-process retry budget for blobs that repeatedly fail embedding.
@@ -98,12 +99,11 @@ def _session() -> requests.Session:
 
 
 def _fetch_blob(blob_id: str) -> Optional[bytes]:
-    url = f"{AGGREGATOR_URL}/v1/blobs/{blob_id}"
-    try:
-        resp = _session().get(url, timeout=60)
-        return resp.content if resp.status_code == 200 else None
-    except requests.RequestException:
+    """Fetch blob bytes via the aggregator pool (load-balanced)."""
+    resp, _ = get_pool().get(f"/v1/blobs/{blob_id}", session=_session(), timeout=60)
+    if resp is None or resp.status_code != 200:
         return None
+    return resp.content
 
 
 # ── NSFW scoring ───────────────────────────────────────────────────────────────
@@ -134,23 +134,52 @@ def _index_one(blob_id: str) -> Optional[Dict[str, Any]]:
     except RuntimeError as exc:
         err = str(exc).lower()
         if "illegal" in err and "memory" in err:
-            print("FATAL: CUDA Illegal Memory Access. Exiting to force restart.")
+            print("[VectorIndexer] FATAL: CUDA Illegal Memory Access. Exiting to force restart.")
             os._exit(1)
-        print(f"{blob_id}: CUDA error: {exc}")
+        print(f"[VectorIndexer] {blob_id}: CUDA error: {exc}")
         return None
     except Exception as exc:
-        print(f"{blob_id}: embedding failed: {exc}")
+        print(f"[VectorIndexer] {blob_id}: embedding failed: {exc}")
         return None
 
     if embedding is None:
         return None
 
-    score = _nsfw_score(embedding)
+    # NSFW: prefer the VLM labeler (actually looks at the image); fall back to the
+    # legacy embedding-cosine score when the VLM is disabled/unavailable.
+    from omura.utils.nsfw_labeler import classify_nsfw
+
+    vlm = classify_nsfw(content)
+    if vlm is not None:
+        score, is_nsfw, _label = vlm
+    else:
+        score = _nsfw_score(embedding)
+        is_nsfw = is_nsfw_from_tag_score(score)
+
+    # Generate image caption — check DB cache first (blob_id is content-addressed,
+    # so a stored caption is permanent and never needs regeneration). Matches prod.
+    import sqlite3
+    from omura.utils.captioning import generate_caption
+    caption: Optional[str] = None
+    try:
+        with sqlite3.connect(str(CATALOG_DB_PATH), timeout=10) as _conn:
+            row = _conn.execute(
+                "SELECT caption FROM blobs WHERE blob_id=? AND caption IS NOT NULL AND caption!=''",
+                (blob_id,),
+            ).fetchone()
+            if row:
+                caption = row[0]
+    except Exception:
+        pass
+    if not caption:
+        caption = generate_caption(content)
+
     return {
         "blob_id": blob_id,
         "embedding": embedding,
         "nsfw_score": score,
-        "is_nsfw": is_nsfw_from_tag_score(score),
+        "is_nsfw": is_nsfw,
+        "caption": caption,
     }
 
 
@@ -169,23 +198,24 @@ def _rebuild_clusters(store: VectorStore, db_path: Path) -> None:
         return
 
     with store._lock:
-        emb_list = (
-            list(store.embeddings_dict.values())
+        # embeddings_dict is {blob_id: np.ndarray}; values are arrays, not dicts.
+        items = (
+            list(store.embeddings_dict.items())
             if hasattr(store, "embeddings_dict")
             else []
         )
 
-    if len(emb_list) < N_CLUSTERS * 2:
+    if len(items) < N_CLUSTERS * 2:
         print(
-            f"[VectorIndexer] Not enough embeddings ({len(emb_list)}) for {N_CLUSTERS} clusters, skipping"
+            f"[VectorIndexer] Not enough embeddings ({len(items)}) for {N_CLUSTERS} clusters, skipping"
         )
         return
 
     print(
-        f"[VectorIndexer] Rebuilding {N_CLUSTERS} clusters over {len(emb_list)} embeddings..."
+        f"[VectorIndexer] Rebuilding {N_CLUSTERS} clusters over {len(items)} embeddings..."
     )
-    X = np.vstack([e["embedding"] for e in emb_list]).astype(np.float32)
-    blob_ids = [e["blob_id"] for e in emb_list]
+    blob_ids = [b for b, _ in items]
+    X = np.vstack([np.asarray(e, dtype=np.float32).flatten() for _, e in items])
 
     km = MiniBatchKMeans(
         n_clusters=N_CLUSTERS, random_state=42, n_init=3, batch_size=2048
@@ -350,6 +380,7 @@ def _process_queue_batch(
                 "blob_id": r["blob_id"],
                 "is_nsfw": r["is_nsfw"],
                 "nsfw_score": r["nsfw_score"],
+                "caption": r.get("caption"),
             }
             for r in results
         ],
@@ -398,7 +429,7 @@ def run_vector_indexer(
     """
     init_catalog_db(db_path)
     print(
-        f"[VectorIndexer] Starting. model=OMURA_EMBEDDING_MODEL "
+        f"[VectorIndexer] Starting vector indexer that's crunching the embeddings. model=OMURA_EMBEDDING_MODEL "
         f"batch={BATCH_SIZE} fetch_workers={MAX_FETCH_WORKERS}"
     )
 

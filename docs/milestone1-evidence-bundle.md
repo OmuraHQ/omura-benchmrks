@@ -394,7 +394,9 @@ The 500k figure refers to Walrus blobs that have been **catalogued with file-typ
 |---|---|---|
 | Total blobs catalogued (all time, all types) | **590,130** | ≥ 500,000 ✓ |
 | Active blobs (current epoch) | 131,907 | — |
-| Quilts catalogued (active) | **49,303** | incl. Quilt ✓ |
+| Quilts catalogued (active) | **4
+
+Quilt ✓ |
 | Blob authenticity | Real Walrus blobs discovered via Sui GraphQL (`blob::Blob` object filter) + Blockberry epoch validation. No synthetic or seeded rows. | ✓ |
 
 The 590,130 all-time total is composed entirely of real on-chain Walrus blobs. Discovery uses `omura/utils/blob_discovery.py` (Sui GraphQL `objects(filter: { type: ... blob::Blob })`) filtered by active epoch via `omura/utils/blockberry.py`. There is no seeding or inflation mechanism in the codebase.
