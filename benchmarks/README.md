@@ -7,6 +7,7 @@ Dependencies are defined in `benchmarks/pyproject.toml`.
 
 - `benchmark_omura_emmbed.py`: startup time, text/image throughput, and retrieval sanity benchmark.
 - `benchmark_coco_retrieval.py`: COCO text-image retrieval benchmark (Recall@K).
+- `benchmark_coco_i2i.py`: COCO image-to-image (i2i) retrieval benchmark on transformed queries (Recall@K).
 
 ## Quick start
 
@@ -18,6 +19,11 @@ uv run benchmark_omura_emmbed.py --rounds 5
 ```bash
 cd benchmarks
 uv run benchmark_coco_retrieval.py --num-images 1000
+```
+
+```bash
+cd benchmarks
+uv run benchmark_coco_i2i.py --num-images 1000
 ```
 
 COCO val2014 annotations and images are downloaded under `data/coco/` when missing (use `--no-download-coco` to require pre-downloaded data).

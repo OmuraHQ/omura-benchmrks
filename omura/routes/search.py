@@ -7,6 +7,7 @@ import threading
 import sqlite3
 import json
 import numpy as np
+import requests
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -215,6 +216,7 @@ class ReverseImageResponse(BaseModel):
     results: List[Dict[str, Any]]
     total: int
     query_phash: Optional[str] = None
+    query_caption: Optional[str] = None
     duplicates_found: int = 0
     exact_duplicate_blob_id: Optional[str] = None
     provenance: Optional[Dict[str, Any]] = None
@@ -551,6 +553,12 @@ def _modality_search(
 _REVERSE_IMAGE_MAX_BYTES = int(
     os.getenv("OMURA_REVERSE_IMAGE_MAX_BYTES", str(25 * 1024 * 1024))
 )
+
+# Weight given to the query image's generated-caption text embedding when blended
+# into the search vector (0 = pure visual, 1 = pure caption-text). Kept small since
+# the caption is a lossy proxy for the image; it nudges ranking toward semantic
+# matches without overriding visual similarity.
+_REVERSE_IMAGE_CAPTION_WEIGHT = float(os.getenv("OMURA_REVERSE_IMAGE_CAPTION_WEIGHT", "0.2"))
 
 
 def _soft_rerank(
@@ -1809,8 +1817,31 @@ async def rebuild_nsfw_classifier(
     )
 
 
-def _fetch_blob_bytes(blob_id: str, timeout: int = 30) -> Optional[bytes]:
-    """Fetch raw bytes of an indexed blob (plain or quilt-patch) via the aggregator pool."""
+_REVERSE_IMAGE_CACHE_DIR = os.getenv(
+    "OMURA_BLOB_CACHE_DIR", os.path.join(os.getcwd(), "data", "blob_cache")
+)
+_rev_img_tls = threading.local()
+
+
+def _rev_img_session() -> "requests.Session":
+    """Thread-local pooled HTTP session (avoids a fresh TCP+TLS handshake per candidate)."""
+    if not hasattr(_rev_img_tls, "s"):
+        s = requests.Session()
+        a = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16)
+        s.mount("https://", a)
+        s.mount("http://", a)
+        _rev_img_tls.s = s
+    return _rev_img_tls.s
+
+
+def _fetch_blob_bytes(blob_id: str, timeout: "tuple[float, float]" = (3.0, 8.0)) -> Optional[bytes]:
+    """Fetch raw bytes of an indexed blob (plain or quilt-patch) via the aggregator pool.
+
+    Disk-cached (blob content is immutable/content-addressed) and uses a short
+    per-attempt timeout so a single slow/dead upstream can't stall the whole
+    reverse-image-search hardening pass — the pool fails over to the next
+    healthy upstream instead of blocking a worker for the full timeout.
+    """
     from omura.utils.aggregator_pool import get_pool
     import requests as _rq
     if "::" in blob_id:
@@ -1819,10 +1850,11 @@ def _fetch_blob_bytes(blob_id: str, timeout: int = 30) -> Optional[bytes]:
     else:
         path = f"/v1/blobs/{blob_id}"
     try:
-        resp, _ = get_pool().get(path, timeout=timeout)
-        if resp is None or resp.status_code != 200:
-            return None
-        return resp.content
+        data, _ = get_pool().get_blob_cached(
+            path, _REVERSE_IMAGE_CACHE_DIR,
+            session=_rev_img_session(), timeout=timeout, max_tries=4,
+        )
+        return data
     except Exception:
         return None
 
@@ -1917,6 +1949,21 @@ async def reverse_image_search(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Failed to generate embedding for image.",
         )
+
+    # Caption the query image and blend its text embedding into the query vector —
+    # catches semantic matches (re-crops, edits, recolors) that pure visual cosine
+    # similarity can miss, since the two embeddings share the same joint space.
+    from omura.utils.captioning import generate_caption
+    query_caption = await run_in_threadpool(generate_caption, image_bytes)
+    if query_caption:
+        cap_emb = await run_in_threadpool(generate_text_embedding, query_caption, False, None)
+        if cap_emb is not None:
+            w = _REVERSE_IMAGE_CAPTION_WEIGHT
+            blended = (1.0 - w) * qemb + w * cap_emb
+            norm = np.linalg.norm(blended)
+            if norm > 0:
+                qemb = blended / norm
+
     base = _similar_images_from_embedding(
         store, qemb, top_k=top_k, exclude_nsfw=exclude_nsfw, query_kind="image"
     )
@@ -1928,6 +1975,7 @@ async def reverse_image_search(
     return ReverseImageResponse(
         results=results, total=len(results),
         query_phash=summary["query_phash"],
+        query_caption=query_caption or None,
         duplicates_found=summary["duplicates_found"],
         exact_duplicate_blob_id=summary["exact_duplicate_blob_id"],
         provenance=summary["provenance"],

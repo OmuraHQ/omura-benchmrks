@@ -176,6 +176,18 @@ def _ingest_blob(
         _upsert_catalog(blob_id, mime, ext, kind, size, False)
         return "embed_failed"
 
+    from omura.utils.nsfw_labeler import classify_nsfw
+    vlm = classify_nsfw(content)
+    if vlm is not None:
+        nsfw_score, is_nsfw, _label = vlm
+    else:
+        from omura.utils.imagebind_embeddings import (
+            get_nsfw_embeddings, is_nsfw_from_tag_score, nsfw_similarity_score_0_100,
+        )
+        nsfw_vecs = get_nsfw_embeddings()
+        nsfw_score = nsfw_similarity_score_0_100(emb, nsfw_vecs) if nsfw_vecs else 0.0
+        is_nsfw = is_nsfw_from_tag_score(nsfw_score)
+
     with store_lock:
         store.add(
             embedding=emb,
@@ -184,7 +196,8 @@ def _ingest_blob(
             size=size,
             extension=ext,
             kind=kind,
-            is_nsfw=False,
+            is_nsfw=is_nsfw,
+            nsfw_score=nsfw_score,
             source="walrus_event",
         )
         # Save immediately so the API hot-reloads within the same poll cycle

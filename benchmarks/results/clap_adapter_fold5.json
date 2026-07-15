@@ -1,0 +1,27 @@
+{
+  "model": "laion/larger_clap_general",
+  "dataset": "ashraq/esc50",
+  "task": "zero-shot audio classification (adapter)",
+  "fold_filtered": 5,
+  "num_clips": 400,
+  "num_classes": 50,
+  "target_sr": 48000,
+  "threshold": 0.85,
+  "best_prompt": "a_recording_of_a",
+  "best_accuracy": 0.9575,
+  "pass": true,
+  "per_prompt": {
+    "a_sound_of_a": {
+      "prompt": "a sound of a {}",
+      "accuracy": 0.945
+    },
+    "a_recording_of_a": {
+      "prompt": "a recording of a {}",
+      "accuracy": 0.9575
+    },
+    "this_is_a": {
+      "prompt": "this is a sound of {}",
+      "accuracy": 0.9575
+    }
+  }
+}

@@ -188,6 +188,18 @@ def _ingest_nft(
         _mark_indexed(blob_id, False)
         return "embed_failed"
 
+    from omura.utils.nsfw_labeler import classify_nsfw
+    vlm = classify_nsfw(content)
+    if vlm is not None:
+        nsfw_score, is_nsfw, _label = vlm
+    else:
+        from omura.utils.imagebind_embeddings import (
+            get_nsfw_embeddings, is_nsfw_from_tag_score, nsfw_similarity_score_0_100,
+        )
+        nsfw_vecs = get_nsfw_embeddings()
+        nsfw_score = nsfw_similarity_score_0_100(emb, nsfw_vecs) if nsfw_vecs else 0.0
+        is_nsfw = is_nsfw_from_tag_score(nsfw_score)
+
     with store_lock:
         store.add(
             embedding=emb,
@@ -196,7 +208,8 @@ def _ingest_nft(
             size=len(content),
             extension=ext,
             kind=kind,
-            is_nsfw=False,
+            is_nsfw=is_nsfw,
+            nsfw_score=nsfw_score,
             source="bellyseal",
             nft_id=nft_id,
             generation_id=generation_id,

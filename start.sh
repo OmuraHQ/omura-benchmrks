@@ -76,7 +76,81 @@ stop_proc() {
     rm -f "$pid_file"
 }
 
+ensure_envs() {
+    # 1. Main API server environment
+    if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
+        echo "[start.sh] Creating main .venv..."
+        uv venv "$ROOT/.venv" --python 3.11
+        uv sync
+    fi
+
+    # 2. Caption sidecar environment
+    if [[ ! -x "$ROOT/.venv-caption/bin/python" ]]; then
+        echo "[start.sh] Creating .venv-caption..."
+        uv venv "$ROOT/.venv-caption" --python 3.11
+        VIRTUAL_ENV="$ROOT/.venv-caption" uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+        VIRTUAL_ENV="$ROOT/.venv-caption" uv pip install transformers pillow einops accelerate
+    fi
+
+    # 3. Video service environment
+    local iv2_dir="$ROOT/benchmarks/eval/internvideo2"
+    if [[ ! -x "$iv2_dir/.venv-iv2/bin/python" ]]; then
+        echo "[start.sh] Creating .venv-iv2..."
+        uv venv "$iv2_dir/.venv-iv2" --python 3.10
+        VIRTUAL_ENV="$iv2_dir/.venv-iv2" uv pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+            --index-url https://download.pytorch.org/whl/cu121
+        VIRTUAL_ENV="$iv2_dir/.venv-iv2" uv pip install transformers==4.28.1 "tokenizers<0.14" timm==0.5.4 einops \
+            decord opencv-python-headless==4.8.0.76 librosa==0.10.1 soundfile==0.12.1 \
+            "datasets>=2.18,<3" pandas pyarrow easydict pyyaml termcolor scipy ftfy regex tqdm \
+            "huggingface_hub>=0.23"
+        VIRTUAL_ENV="$iv2_dir/.venv-iv2" uv pip install peft==0.5.0 "accelerate<0.30" open_clip_torch
+        VIRTUAL_ENV="$iv2_dir/.venv-iv2" uv pip install numpy==1.24.4
+        VIRTUAL_ENV="$iv2_dir/.venv-iv2" uv pip install "setuptools<81"
+
+        # Install flash_attn stubs
+        local sp_dir
+        sp_dir="$iv2_dir/.venv-iv2/lib/python3.10/site-packages"
+        mkdir -p "$sp_dir/flash_attn/modules" "$sp_dir/flash_attn/ops"
+        
+        cat << 'EOF' > "$sp_dir/flash_attn/__init__.py"
+# Stub flash_attn: symbols exist so imports succeed; never invoked because the
+# model is configured with use_flash_attn/use_fused_mlp/use_fused_rmsnorm = False.
+__version__ = "0.0.0-stub"
+def _unavail(*a, **k):
+    raise RuntimeError("flash_attn stub: flash kernels disabled in this eval")
+EOF
+
+        cat << 'EOF' > "$sp_dir/flash_attn/flash_attn_interface.py"
+def flash_attn_varlen_qkvpacked_func(*a, **k):
+    raise RuntimeError("flash_attn stub invoked but flash disabled")
+EOF
+
+        cat << 'EOF' > "$sp_dir/flash_attn/bert_padding.py"
+def unpad_input(*a, **k):
+    raise RuntimeError("flash_attn stub")
+def pad_input(*a, **k):
+    raise RuntimeError("flash_attn stub")
+EOF
+
+        touch "$sp_dir/flash_attn/modules/__init__.py"
+        cat << 'EOF' > "$sp_dir/flash_attn/modules/mlp.py"
+class FusedMLP:
+    def __init__(self,*a,**k):
+        raise RuntimeError("flash_attn stub FusedMLP invoked but disabled")
+EOF
+
+        touch "$sp_dir/flash_attn/ops/__init__.py"
+        cat << 'EOF' > "$sp_dir/flash_attn/ops/rms_norm.py"
+class DropoutAddRMSNorm:
+    def __init__(self,*a,**k):
+        raise RuntimeError("flash_attn stub DropoutAddRMSNorm invoked but disabled")
+EOF
+    fi
+}
+
 do_start() {
+    ensure_envs
+
     # 1. Main API server + in-process cataloger/vector-indexer/BellySeal/Walrus-blob threads
     #    (OMURA_INSTANCE_ROLE defaults to "all" -> single process handles ingestion + serving).
     start_proc "api server" "$PID_DIR/api.pid" "$LOG_DIR/api.log" \

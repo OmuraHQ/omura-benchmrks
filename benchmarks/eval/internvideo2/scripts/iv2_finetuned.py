@@ -21,6 +21,15 @@ def load(heads_path: str | None = None, device: str = "cuda"):
         return _state["model"], _state["tok"], _state["cfg"]
     model, tok, cfg = C.load_model(device=device)
     heads_path = heads_path or os.getenv("OMURA_VIDEO_HEADS", "")
+    if not heads_path or not os.path.exists(heads_path):
+        try:
+            from huggingface_hub import hf_hub_download
+            print("[omura-embed-video] Downloading best_heads.pt from Hugging Face Hub (immortaltatsu/omura-embed-video)...")
+            heads_path = hf_hub_download(repo_id="immortaltatsu/omura-embed-video", filename="best_heads.pt")
+        except Exception as e:
+            print(f"[omura-embed-video] WARNING: Failed to download heads from Hugging Face: {e}")
+            heads_path = None
+
     if heads_path and os.path.exists(heads_path):
         ckpt = torch.load(heads_path, map_location="cpu", weights_only=False)
         # heads were trained in fp32; cast to the model dtype for inference

@@ -29,10 +29,24 @@ def l2(x: np.ndarray) -> np.ndarray:
     return x / n
 
 
+class ClapAdapterHead(torch.nn.Module):
+    """Small residual linear adapter: out = normalize(x + W x)."""
+
+    def __init__(self, dim: int = 512):
+        super().__init__()
+        self.proj = torch.nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+        return F.normalize(x + self.proj(x), dim=-1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="laion/larger_clap_general")
     ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--adapter", action="store_true", help="load and use the immortaltatsu/omura-embed-audio adapter")
+    ap.add_argument("--fold", type=int, default=0, help="filter dataset by fold (1-5)")
     ap.add_argument("--out", type=Path, default=Path("results/clap_esc50.json"))
     args = ap.parse_args()
 
@@ -42,7 +56,26 @@ def main() -> None:
     processor = ClapProcessor.from_pretrained(args.model)
     target_sr = processor.feature_extractor.sampling_rate  # 48000 for CLAP
 
+    adapter_head = None
+    if args.adapter:
+        try:
+            from huggingface_hub import hf_hub_download
+            print("[CLAP] Loading adapter head from HF (immortaltatsu/omura-embed-audio)...")
+            path = hf_hub_download(repo_id="immortaltatsu/omura-embed-audio", filename="omura_clap_head.pt")
+            ckpt = torch.load(path, map_location=device)
+            adapter_head = ClapAdapterHead(dim=model.config.projection_dim).to(device)
+            adapter_head.load_state_dict(ckpt["state_dict"])
+            adapter_head.eval()
+            print("[CLAP] Adapter loaded.")
+        except Exception as e:
+            print(f"[CLAP] Failed to load adapter: {e}")
+            raise SystemExit(1)
+
     ds = load_dataset("ashraq/esc50", split="train")
+    if args.fold:
+        ds = ds.filter(lambda x: int(x["fold"]) == args.fold)
+        print(f"[CLAP] Filtered to fold {args.fold}")
+        
     # Canonical class list (sorted by ESC-50 target id for stability)
     cls_by_target = {}
     for ex in ds:
@@ -64,7 +97,10 @@ def main() -> None:
             return
         inp = processor(audios=buf, sampling_rate=target_sr, return_tensors="pt").to(device)
         with torch.no_grad():
-            feats = model.get_audio_features(**inp).cpu().numpy()
+            feats = model.get_audio_features(**inp)
+            if adapter_head is not None:
+                feats = adapter_head(feats)
+            feats = feats.cpu().numpy()
         for j, gi in enumerate(idxs):
             audio_vecs[gi] = feats[j]
 
@@ -103,7 +139,8 @@ def main() -> None:
     out = {
         "model": args.model,
         "dataset": "ashraq/esc50",
-        "task": "zero-shot audio classification",
+        "task": f"zero-shot audio classification{' (adapter)' if args.adapter else ''}",
+        "fold_filtered": args.fold or None,
         "num_clips": len(ds),
         "num_classes": len(classes),
         "target_sr": target_sr,

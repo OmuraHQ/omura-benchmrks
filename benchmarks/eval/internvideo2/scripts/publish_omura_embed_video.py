@@ -71,7 +71,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--heads", required=True)
     ap.add_argument("--results", required=True)
-    ap.add_argument("--repo", default=os.getenv("OMURA_VIDEO_HF_REPO", "immortaltatsu/omura_embed_video"))
+    ap.add_argument("--repo", default=os.getenv("OMURA_VIDEO_HF_REPO", "immortaltatsu/omura-embed-video"))
     ap.add_argument("--token", default=os.getenv("HF_TOKEN", ""))
     ap.add_argument("--private", action="store_true")
     args = ap.parse_args()

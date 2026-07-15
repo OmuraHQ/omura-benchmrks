@@ -13,6 +13,8 @@ Endpoints:
   GET  /health                      -> {"ok": true, "model": "moondream2"}
   POST /caption  (raw image bytes)  -> {"caption": "..."}
      optional query ?length=short|normal  (default normal)
+  POST /query  (raw image bytes)    -> {"answer": "..."}
+     required query ?question=...  (VQA; used by the NSFW labeler)
 """
 import os, sys, json, argparse, threading
 from io import BytesIO
@@ -59,6 +61,16 @@ def caption_bytes(image_bytes: bytes, length: str = DEFAULT_LENGTH) -> str:
     return " ".join((out or "").split())
 
 
+def query_bytes(image_bytes: bytes, question: str) -> str:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    if max(img.size) > MAX_DIM:
+        s = MAX_DIM / max(img.size)
+        img = img.resize((int(img.width * s), int(img.height * s)))
+    with _infer_lock:
+        out = load().query(img, question)["answer"]
+    return " ".join((out or "").split())
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
         body = json.dumps(obj).encode()
@@ -76,15 +88,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        if u.path != "/caption":
+        if u.path not in ("/caption", "/query"):
             self._send(404, {"error": "not found"}); return
         try:
             n = int(self.headers.get("Content-Length", 0))
             data = self.rfile.read(n)
             if not data:
                 self._send(400, {"error": "empty body"}); return
-            length = (parse_qs(u.query).get("length", [DEFAULT_LENGTH])[0])
-            self._send(200, {"caption": caption_bytes(data, length)})
+            if u.path == "/caption":
+                length = (parse_qs(u.query).get("length", [DEFAULT_LENGTH])[0])
+                self._send(200, {"caption": caption_bytes(data, length)})
+            else:
+                question = (parse_qs(u.query).get("question", [""])[0])
+                if not question:
+                    self._send(400, {"error": "missing question"}); return
+                self._send(200, {"answer": query_bytes(data, question)})
         except Exception as e:  # noqa: BLE001
             self._send(500, {"error": str(e)})
 

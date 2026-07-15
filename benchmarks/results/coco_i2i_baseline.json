@@ -1,0 +1,15 @@
+{
+  "model": "google/siglip2-so400m-patch14-384",
+  "eval_mode": "image_to_image_transformed",
+  "num_images": 1000,
+  "transformations": {
+    "border_crop": "5%",
+    "resize": "90%",
+    "jpeg_quality": 60
+  },
+  "image_to_image": {
+    "R@1": 1.0,
+    "R@5": 1.0,
+    "R@10": 1.0
+  }
+}

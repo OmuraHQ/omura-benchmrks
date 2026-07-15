@@ -31,6 +31,37 @@ _processor = None
 _device = None
 _load_lock = threading.Lock()
 _load_failed = False
+_adapter_head = None
+
+
+class ClapAdapterHead(torch.nn.Module):
+    """Small residual linear adapter: out = normalize(x + W x)."""
+
+    def __init__(self, dim: int = 512):
+        super().__init__()
+        self.proj = torch.nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+        return F.normalize(x + self.proj(x), dim=-1)
+
+
+def _load_adapter():
+    global _adapter_head
+    if os.getenv("OMURA_CLAP_ADAPTER", "true").lower() != "true":
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+        import torch
+        print("[CLAP] Downloading/loading adapter head from Hugging Face Hub (immortaltatsu/omura-embed-audio)...")
+        path = hf_hub_download(repo_id="immortaltatsu/omura-embed-audio", filename="omura_clap_head.pt")
+        ckpt = torch.load(path, map_location=_device)
+        _adapter_head = ClapAdapterHead(dim=CLAP_DIM).to(_device)
+        _adapter_head.load_state_dict(ckpt["state_dict"])
+        _adapter_head.eval()
+        print("[CLAP] Adapter head loaded and active.")
+    except Exception as e:
+        print(f"[CLAP] WARNING: Failed to load adapter head: {e}")
 
 
 def _ensure_loaded() -> bool:
@@ -56,6 +87,7 @@ def _ensure_loaded() -> bool:
             _processor = ClapProcessor.from_pretrained(CLAP_MODEL)
             _model = model
             print("[CLAP] Loaded.")
+            _load_adapter()
             return True
         except Exception as e:  # pragma: no cover - environment dependent
             print(f"[CLAP] Load failed: {e}")
@@ -139,7 +171,13 @@ def embed_audio(audio_data: bytes, ext: str = "", blob_id: str = "") -> Optional
         # transformers>=5 returns an output object whose pooler_output is the
         # projected 512-d joint embedding (== ClapOutput.audio_embeds).
         feats = out.pooler_output if hasattr(out, "pooler_output") else out
-        return _normalize(feats[0].float().cpu().numpy())
+        raw_feat = feats[0]
+        
+        # Apply adapter head if loaded
+        if _adapter_head is not None:
+            raw_feat = _adapter_head(raw_feat.unsqueeze(0)).squeeze(0)
+            
+        return _normalize(raw_feat.float().cpu().numpy())
     except Exception as e:
         print(f"[CLAP] embed_audio failed for {blob_id}: {e}")
         return None

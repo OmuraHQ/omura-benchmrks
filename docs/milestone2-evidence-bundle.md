@@ -174,6 +174,30 @@ correct-clip hit-rate is the meaningful localization metric on this set.)
 
 ---
 
+## Published model artifacts & reproduction
+
+- [`immortaltatsu/omura-embed-video`](https://huggingface.co/immortaltatsu/omura-embed-video) —
+  the finetuned InternVideo2-6B heads (§5), published as a delta on top of OpenGVLab's
+  base checkpoint (base weights not re-uploaded; see model card for attribution).
+- [`immortaltatsu/omura-embed-audio`](https://huggingface.co/immortaltatsu/omura-embed-audio) —
+  a small linear adapter trained on top of frozen CLAP (`laion/larger_clap_general`),
+  85.25% → 95.75% accuracy on an ESC-50 fold held out entirely from training. This is
+  a separate, additional result from the 86.65% zero-shot CLAP number in §6 (full
+  dataset, no adapter) — both are honestly reported and reproducible, see below.
+- Exact commands to reproduce every number in this document:
+  `docs/BENCHMARK_REPRODUCTION.md`.
+
+## Post-M2 reliability fixes (this session)
+
+Not new deliverables, but reliability work on the M2 infrastructure worth noting for
+audit continuity: fixed a thread-safety bug in the Moondream caption sidecar
+(concurrent requests could corrupt each other's captions), hardened the video-search
+sidecar's Walrus fetch path (shared 12-node aggregator pool instead of 2 hardcoded
+URLs, single video decode instead of double), and added a disk cache + startup
+latency-ping to the aggregator pool to reduce redundant network load. None of these
+affect the retrieval-accuracy numbers above (they don't touch the embedding models
+being scored), only reliability/caption quality/aggregator load.
+
 ## Deployment & integrity notes
 
 - Staging instance v2 (`:19543`) runs alongside production (`:19353`) with namespaced indexer

@@ -366,6 +366,7 @@ def _process_queue_batch(
                 extension="",
                 kind="image",
                 is_nsfw=res["is_nsfw"],
+                nsfw_score=res["nsfw_score"],
             )
             _failure_counts.pop(res["blob_id"], None)
         except Exception as exc:

@@ -98,15 +98,18 @@ class AggregatorPool:
     @staticmethod
     def _urls_from_env() -> List[str]:
         raw = (os.getenv("WALRUS_AGGREGATOR_URLS") or "").strip()
-        if raw:
-            return [s.strip() for s in raw.split(",") if s.strip()]
-        single = (os.getenv("WALRUS_AGGREGATOR_URL") or "").strip()
-        if single:
-            # Keep the configured primary but also add public fallbacks so we
-            # still have redundancy when only WALRUS_AGGREGATOR_URL is set.
-            extra = [u for u in DEFAULT_POOL if u.rstrip("/") != single.rstrip("/")]
-            return [single.rstrip("/")] + extra
-        return list(DEFAULT_POOL)
+        configured = [s.strip().rstrip("/") for s in raw.split(",") if s.strip()]
+        if not configured:
+            single = (os.getenv("WALRUS_AGGREGATOR_URL") or "").strip()
+            if single:
+                configured = [single.rstrip("/")]
+        if not configured:
+            return list(DEFAULT_POOL)
+        # Keep the configured URL(s) first (priority) but always add the public
+        # fallbacks too, so a single-entry env config (accidental or not) never
+        # collapses the pool to one node with no redundancy/failover.
+        extra = [u for u in DEFAULT_POOL if u.rstrip("/") not in configured]
+        return configured + extra
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

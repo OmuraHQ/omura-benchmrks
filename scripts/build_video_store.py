@@ -39,6 +39,7 @@ def main():
                   size=int(m.get("size") or 0),
                   extension=m.get("extension"), kind="video",
                   is_nsfw=bool(m.get("is_nsfw")),
+                  nsfw_score=m.get("nsfw_score"),
                   end_epoch=m.get("end_epoch"), owner=m.get("owner"))
         added += 1
     store.save(create_backup=False)

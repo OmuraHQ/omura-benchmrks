@@ -1,33 +1,37 @@
 """VLM-based NSFW labeler — the safety counterpart to captioning.py.
 
-Uses the same persistent Gemma 4 VL `llama-server` (mmproj vision) to actually *look*
-at the image and classify its safety, instead of the crude image-embedding cosine to
-NSFW text prototypes. Returns a graded 0-100 score on the same scale the rest of the
-pipeline already uses (`nsfw_score`, `is_nsfw`), so it's a drop-in upgrade.
+Uses the same persistent Moondream2 sidecar (scripts/caption_service.py, VQA via its
+`/query` endpoint) to actually *look* at the image and classify its safety, instead of
+the crude image-embedding cosine to NSFW text prototypes. Returns a graded 0-100 score
+on the same scale the rest of the pipeline already uses (`nsfw_score`, `is_nsfw`), so
+it's a drop-in upgrade.
+
+Previously this targeted a standalone Gemma-4-VL `llama-server` (OpenAI chat-completions
+protocol) that no sidecar ever actually started — every call 404/500'd and silently fell
+back to the embedding-cosine method for every single image. Moondream's `/query` endpoint
+(same already-loaded model as captioning, zero extra GPU memory) replaces that.
 
 Config (env):
   OMURA_NSFW_BACKEND        "vlm" (default) | "embedding"  (embedding = legacy cosine)
-  OMURA_NSFW_SERVER_URL     default: same as captioner (OMURA_CAPTION_SERVER_URL or :18080)
-  OMURA_NSFW_MAX_TOKENS     generation budget incl. reasoning (default 1200)
+  OMURA_NSFW_SERVER_URL     default: derived from OMURA_CAPTION_SERVER_URL's host/port
+                            (Moondream sidecar), e.g. http://127.0.0.1:18085/query
   OMURA_NSFW_THRESHOLD      score ≥ this ⇒ is_nsfw (default 80)
 """
 
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Reuse the captioner's image normalization (fixes llama.cpp "failed to decode" 400s).
 from omura.utils.captioning import _to_jpeg
-import base64
 
 NSFW_BACKEND = os.getenv("OMURA_NSFW_BACKEND", "vlm").strip().lower()
-_SERVER_URL = os.getenv(
-    "OMURA_NSFW_SERVER_URL",
-    os.getenv("OMURA_CAPTION_SERVER_URL", "http://127.0.0.1:18080/v1/chat/completions"),
-).strip()
-_MAX_TOKENS = int(os.getenv("OMURA_NSFW_MAX_TOKENS", "1200"))
-_TIMEOUT = float(os.getenv("OMURA_NSFW_TIMEOUT", "180"))
+_CAPTION_URL = os.getenv("OMURA_CAPTION_SERVER_URL", "http://127.0.0.1:18085/caption").strip()
+_DEFAULT_NSFW_URL = _CAPTION_URL.rsplit("/caption", 1)[0] + "/query"
+_SERVER_URL = os.getenv("OMURA_NSFW_SERVER_URL", _DEFAULT_NSFW_URL).strip()
+_TIMEOUT = float(os.getenv("OMURA_NSFW_TIMEOUT", "60"))
 NSFW_THRESHOLD = float(os.getenv("OMURA_NSFW_THRESHOLD", "80"))
 
 # Graded labels → 0-100 score. The model picks exactly one word.
@@ -52,35 +56,15 @@ _server_down = False
 
 
 def _vlm_label(image_bytes: bytes) -> str:
-    b64 = base64.b64encode(_to_jpeg(image_bytes)).decode()
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    {"type": "text", "text": _PROMPT},
-                ],
-            }
-        ],
-        "max_tokens": _MAX_TOKENS,
-        "temperature": 0.0,
-        "stream": False,
-    }
+    jpeg = _to_jpeg(image_bytes)
+    q = urllib.parse.quote(_PROMPT)
     req = urllib.request.Request(
-        _SERVER_URL, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        f"{_SERVER_URL}?question={q}", data=jpeg,
+        headers={"Content-Type": "application/octet-stream"},
     )
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         out = json.load(resp)
-    msg = out["choices"][0]["message"]
-    # Parse ONLY the final answer (`content`) — the reasoning text echoes the prompt's
-    # label definitions ("EXPLICIT = nudity…"), so scanning it would match every image.
-    text = (msg.get("content") or "").strip().upper()
-    if not text:
-        # Token budget exhausted before the final word: use the tail of the reasoning,
-        # where the model states its conclusion (not the definitions near the top).
-        text = (msg.get("reasoning_content") or "")[-160:].upper()
+    text = (out.get("answer") or "").strip().upper()
     for label in ("EXPLICIT", "GORE", "SUGGESTIVE", "SAFE"):
         if label in text:
             return label

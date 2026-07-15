@@ -196,6 +196,7 @@ class VectorStore:
             "owner": extra_metadata.get("owner"),
             "expiresAt": extra_metadata.get("end_epoch"),  # expiresAt
             "is_nsfw": extra_metadata.get("is_nsfw", False),
+            "nsfw_score": extra_metadata.get("nsfw_score"),
             "mime_type": mime_type,
             "extension": extra_metadata.get("extension"),
             "kind": extra_metadata.get("kind"),
@@ -529,9 +530,9 @@ class VectorStore:
                     INSERT INTO blobs (
                         blob_id, end_epoch, size, owner, source,
                         mime_type, extension, kind, actual_size,
-                        is_active, fetch_ok, status, indexed, is_nsfw,
+                        is_active, fetch_ok, status, indexed, is_nsfw, nsfw_score,
                         first_seen_at, last_updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(blob_id) DO UPDATE SET
                         end_epoch=COALESCE(excluded.end_epoch, blobs.end_epoch),
                         size=COALESCE(excluded.size, blobs.size),
@@ -544,6 +545,7 @@ class VectorStore:
                         status=excluded.status,
                         indexed=excluded.indexed,
                         is_nsfw=excluded.is_nsfw,
+                        nsfw_score=COALESCE(excluded.nsfw_score, blobs.nsfw_score),
                         last_updated_at=excluded.last_updated_at
                     """,
                     (
@@ -561,6 +563,7 @@ class VectorStore:
                         "indexed",
                         1,
                         1 if metadata_dict.get("is_nsfw") else 0,
+                        metadata_dict.get("nsfw_score"),
                         now,
                         now,
                     ),
