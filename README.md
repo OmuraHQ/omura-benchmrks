@@ -1,136 +1,95 @@
----
-license: mit
-library_name: transformers
-pipeline_tag: feature-extraction
-tags:
-  - omura-embed
-  - embeddings
-  - multimodal
----
+# Omura Benchmarks — reproduction mirror
 
-# Omura - Walrus Protocol Search Engine
+Standalone harnesses, result artifacts and protocols for Omura's retrieval
+benchmarks. Every number in the evidence bundle can be regenerated from this
+repository.
 
-A search engine for the Walrus protocol that indexes and retrieves blob IDs from Walrus mainnet, with multimodal vector search using Omura Embed.
+- **Backend / product repo:** <https://github.com/OmuraHQ/omura-backend>
+- **Model family:** `google/embeddinggemma-2` (768-d, text + image + video;
+  audio via the Gemma audio adapter)
 
-## Features
+## Phase 3 results (as measured)
 
-- **Blob Discovery**: Scans Sui blockchain to discover all Walrus Blob objects (historical + real-time)
-- **Multimodal Search**: Vector similarity search across text, images, audio, and video using ImageBind
-- **GPU Acceleration**: Leverages A100 GPUs for embedding generation and vector search with NVIDIA cuvs
-- **Persistent Storage**: PostgreSQL database and persistent vector index
-- **Epoch Tracking**: Handles blob expiration and deletion based on Sui epochs
-- **File Type Detection**: Magic bytes detection for accurate file type identification
-- **Text Processing**: Advanced parsing and chunking for webpages, ebooks, and PDFs
-- **Async API**: Fully async FastAPI server for high performance
+| Dataset | Direction | R@10 | Artifact |
+|---|---|---:|---|
+| Flickr30k 1K test | text→image | **98.70%** | `benchmarks/results/flickr30k_gemma_1k.json` |
+| Flickr30k 5K pool (headline) | text→image | **95.06%** | `benchmarks/results/flickr30k_gemma_5k.json` |
+| Sui-native curated set | text→image | **99.10%** | `benchmarks/results/sui_nft_gemma.json` |
+| COCO 1K (cross-check) | text→image | **96.80%** | `benchmarks/results/coco_gemma_1k.json` |
+| ActivityNet Captions (1K videos) | text→video | **98.70%** | `benchmarks/results/activitynet_gemma.json` |
+| MSR-VTT 1K-A | text→video | 83.30% | `benchmarks/results/msrvtt_gemma.json` |
+| AudioCaps (883 clips) | text→audio | 62.05% (Gemma+adapter) | `benchmarks/results/audiocaps_gemma_finetuned.json` |
+| Clotho (held-out) | text→audio | 31.12% (Gemma+adapter) | `benchmarks/results/clotho_gemma_adapter.json` |
+| AudioCaps — CLAP reference | text→audio | 86.10% | `benchmarks/results/audiocaps_finetuned.json` |
 
-## Requirements
+Audio is the open gap: the Gemma audio adapter generalizes (Clotho 15.73% →
+31.12%) but is below the 90% target. The CLAP run is a labelled non-canonical
+reference, not part of the Gemma-only evidence.
 
-- Python 3.11
-- PostgreSQL database
-- NVIDIA GPU (recommended for faster embedding generation)
-- CUDA toolkit
-
-## Installation
-
-Using `uv` (recommended):
+## Quick start
 
 ```bash
-uv pip install -e .
+uv sync
+export OMURA_EMBEDDING_BACKEND=omuragemma
+export OMURA_EMBEDDING_DIM=768
+export PYTHONPATH=.:benchmarks
+export CUDA_VISIBLE_DEVICES=4          # pick a free GPU
+
+# image
+.venv/bin/python benchmarks/benchmark_flickr30k.py --pool 5000
+.venv/bin/python benchmarks/build_sui_nft_eval.py --target 1000
+.venv/bin/python benchmarks/benchmark_sui_nft.py
+.venv/bin/python benchmarks/benchmark_coco_retrieval.py --num-images 1000 --include-image-to-text
+
+# video
+.venv/bin/python benchmarks/benchmark_activitynet.py \
+    --videos-dir data/activitynet/ActivityNet --num-videos 1000
+.venv/bin/python benchmarks/benchmark_msrvtt.py
+
+# audio
+.venv/bin/python benchmarks/benchmark_audiocaps.py
+.venv/bin/python benchmarks/benchmark_clotho.py
 ```
 
-Or using pip:
+Datasets download into `data/` on first run (gitignored). Exact per-artifact
+commands: [`docs/BENCHMARK_PHASE3.md`](docs/BENCHMARK_PHASE3.md).
 
-```bash
-pip install -e .
+## Protocol
+
+All claims follow [`docs/GENERALIZATION_PROTOCOL.md`](docs/GENERALIZATION_PROTOCOL.md):
+
+- No test-set tuning; dev split for selection, test evaluated once.
+- Hardest documented pool is the headline (Flickr30k 5K, not 1K).
+- One held-out dataset per modality (Sui-native/COCO, ActivityNet/MSR-VTT,
+  Clotho).
+- No caption leakage; `leakage_check` is recorded in the artifacts.
+- Adapter weights, train/dev sizes and per-query ranks ship with the results.
+
+## Layout
+
+```
+benchmarks/
+  bench_common.py                 # recall@k, result writers
+  embedding_backend.py            # SigLIP / omuragemma dispatch
+  benchmark_*.py                  # dataset harnesses
+  finetune_audiocaps_*.py         # audio adapters / LoRA
+  train_crossattn.py              # Gemma cross-attention reranker
+  rerank_audiocaps_pipeline.py    # CLAP/VAST fusion failsafe
+  results/                        # measured artifacts (JSON)
+docs/
+  BENCHMARK_PHASE3.md             # numbers, protocols, gaps
+  BENCHMARK_REPRODUCTION.md       # historical M1/M2 reproduction
+  GENERALIZATION_PROTOCOL.md
+  GENERALIZATION_CLOTHO.md
+  PIPELINE_RERANK.md
+  milestone3-evidence.md          # full Phase 3 evidence bundle
 ```
 
-## Configuration
+## Notes
 
-Copy `.env.example` to `.env` and configure:
-
-```bash
-cp .env.example .env
-```
-
-Key configuration variables:
-- `SUI_RPC_URL`: Sui mainnet RPC endpoint
-- `WALRUS_PUBLISHER_URL`: Walrus publisher endpoint
-- `WALRUS_AGGREGATOR_URL`: Walrus aggregator endpoint
-- `DATABASE_URL`: PostgreSQL connection string
-- `GPU_DEVICE`: GPU device ID (default: 0)
-- `OMURA_EMBEDDING_MODEL`: Hugging Face model id used for embeddings.
-
-### Use your Hugging Face Omura Embed model
-
-If you duplicated/renamed your model repo on Hugging Face (for example `immortaltatsu/omura_emebd`), set:
-
-```bash
-export OMURA_EMBEDDING_MODEL="immortaltatsu/omura_emebd"
-```
-
-Omura will load this model via `transformers` at runtime.
-
-## Usage
-
-### Start the API server and indexer:
-
-```bash
-python -m omura.main
-```
-
-Or run with your custom Hugging Face model directly:
-
-```bash
-OMURA_EMBEDDING_MODEL="immortaltatsu/omura_emebd" python -m omura.main
-```
-
-### CLI commands:
-
-```bash
-# Show statistics
-omura stats
-
-# List blobs
-omura list
-
-# Export blobs
-omura export
-```
-
-## API Endpoints
-
-- `GET /blobs` - List all blob IDs (with pagination)
-- `GET /blobs/{blob_id}` - Get blob metadata
-- `GET /blobs/{blob_id}/urls` - Get frontend-usable URLs
-- `POST /search` - Vector similarity search
-- `POST /search/image` - Image-to-image and text-to-image search
-- `GET /stats` - Indexing statistics
-- `GET /health` - Health check and readiness probe
-
-## Benchmark your model
-
-Use the benchmark script to validate latency/throughput and a retrieval sanity check:
-
-```bash
-PYTHONPATH=. python benchmarks/benchmark_omura_emmbed.py --model "immortaltatsu/omura_emebd"
-```
-
-Optional image benchmark:
-
-```bash
-PYTHONPATH=. python benchmarks/benchmark_omura_emmbed.py --model "immortaltatsu/omura_emebd" --image-dir data/samples --max-images 100
-```
-
-Results are saved to `benchmarks/results/omura_emmbed_benchmark.json`.
-
-## Architecture
-
-1. **Blob Discovery Service**: Scans Sui blockchain for Blob objects
-2. **Database Storage**: PostgreSQL for blob metadata
-3. **Multimodal Embeddings**: ImageBind for unified embeddings
-4. **Vector Search**: NVIDIA cuvs for GPU-accelerated similarity search
-5. **REST API**: FastAPI async server
-
-## License
-
-MIT
+- The `omura/utils/` subset here is the minimum needed by the harnesses; the
+  product repo is canonical for the API.
+- Result JSONs include per-query ranks, so metrics can be re-derived without
+  re-running the models.
+- CLAP results are retained as a reference; they do not count toward the
+  Gemma-only Phase 3 claim.

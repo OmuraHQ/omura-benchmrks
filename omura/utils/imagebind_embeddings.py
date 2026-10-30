@@ -21,6 +21,8 @@ import soundfile as sf
 from PIL import Image
 from transformers import AutoModel, AutoModelForImageTextToText, AutoProcessor
 
+from omura.utils.gpu_offload import IdleOffloader, guard
+
 
 # Filter out "System prompt modified" and "Unrecognized keys in rope_scaling"
 class _LogFilter(logging.Filter):
@@ -50,6 +52,33 @@ _LOAD_RETRY_SECONDS = float(os.getenv("OMURA_MODEL_RETRY_SECONDS", "120"))
 _load_failed_at: float = 0.0  # monotonic time of last failure; 0 = never failed
 _fallback_model = None
 _fallback_lock = threading.Lock()
+
+
+def _unload_models() -> None:
+    """Drop every resident copy so the CUDA allocator can reclaim the memory.
+
+    Called by the idle reaper only when no inference is running; the
+    IdleOffloader gate blocks new ``busy()`` scopes until this returns.
+    """
+    global _pool_size, _fallback_model
+
+    with _load_lock:
+        drained = []
+        while True:
+            try:
+                drained.append(_model_pool.get_nowait())
+            except queue.Empty:
+                break
+        for item in drained:
+            del item
+        _pool_size = 0
+        with _fallback_lock:
+            _fallback_model = None
+    print(f"[Embedding] Released {len(drained)} model instance(s) on idle offload", flush=True)
+
+
+# 5 minutes of no inference -> free the GPU; the next call reloads lazily.
+_offload = IdleOffloader("omura-embed", _unload_models)
 
 _QWEN_QUERY_INSTRUCTION = (
     "Retrieve images or text relevant to the user's query."
@@ -99,6 +128,7 @@ def _get_fallback_model():
     return _fallback_model
 
 
+@guard(_offload)
 def _encode_fallback_text(texts: list[str]) -> Optional[np.ndarray]:
     try:
         model, _ = _get_fallback_model()
@@ -114,6 +144,7 @@ def _encode_fallback_text(texts: list[str]) -> Optional[np.ndarray]:
         return None
 
 
+@guard(_offload)
 def _encode_fallback_images(images: list[Image.Image]) -> Optional[np.ndarray]:
     try:
         model, _ = _get_fallback_model()
@@ -168,11 +199,19 @@ def _target_devices() -> list[str]:
 
 def ensure_model_loaded() -> None:
     """Load model instances into the pool if not already loaded. Thread-safe."""
+    if _is_omuragemma_backend():
+        from omura.utils.omuragemma_embeddings import ensure_model_loaded as _gemma_ensure
+
+        _gemma_ensure()
+        return
+
     global _pool_size
     if _pool_size > 0:
+        _offload.touch()
         return
     with _load_lock:
         if _pool_size > 0:
+            _offload.touch()
             return
         if _load_failed_at > 0:
             remaining = _LOAD_RETRY_SECONDS - (time.monotonic() - _load_failed_at)
@@ -181,15 +220,34 @@ def ensure_model_loaded() -> None:
                     f"Model unavailable (load failed); retrying in {remaining:.0f}s"
                 )
         _load_model()
+    _offload.touch()
 
 
 def initialize_embedding_model() -> None:
     """Load embedding model pool at startup. Idempotent."""
-    ensure_model_loaded()
+    with _offload.busy():
+        ensure_model_loaded()
 
 
 # Backward-compatible alias for older call sites.
 initialize_imagebind = initialize_embedding_model
+
+
+_OMURAGEMMA_BACKENDS = {
+    "omuragemma",
+    "embeddinggemma",
+    "embeddinggemma2",
+    "embedding_gemma",
+    "gemma-embedding",
+}
+
+
+def _is_omuragemma_backend() -> bool:
+    """Return True when embeddings run locally with EmbeddingGemma 2."""
+    backend = os.getenv("OMURA_EMBEDDING_BACKEND", "").strip().lower()
+    return backend in _OMURAGEMMA_BACKENDS or MODEL_NAME.lower().startswith(
+        "embeddinggemma"
+    )
 
 
 def _is_gemma_model() -> bool:
@@ -240,6 +298,11 @@ def get_score_multiplier(query_kind: str = "text") -> float:
     if query_kind == "image":
         # Same-modal cosine → direct percentage (no saturation).
         return 100.0
+    if _is_omuragemma_backend():
+        # EmbeddingGemma 2 puts everything in a fairly narrow cosine cone
+        # (unrelated pairs ~0.45-0.55, strong matches ~0.70-0.75). A multiplier
+        # above ~130 saturates every hit at 100, so keep a usable gradient.
+        return float(os.getenv("OMURA_OMURAGEMMA_TEXT_SCORE_MULTIPLIER", "120"))
     if _is_qwen3_vl_embedding_model():
         return 100.0
     if _is_omura_emmbed_model():
@@ -339,6 +402,7 @@ def _load_model() -> None:
     print(f"[Embedding] Pool ready: {loaded}/{len(devices)} device(s)")
 
 
+@guard(_offload)
 def _encode_documents(documents):
     """
     Encodes a list of 'documents'.
@@ -502,6 +566,7 @@ def _qwen_image_messages(img: Image.Image, instruction: str) -> list[dict]:
     ]
 
 
+@guard(_offload)
 def _encode_jina_images(images: list) -> Optional[np.ndarray]:
     """Encode a list of PIL Images with Jina CLIP v2. Returns (n, 1024) float32 array."""
     ensure_model_loaded()
@@ -524,6 +589,7 @@ def _encode_jina_images(images: list) -> Optional[np.ndarray]:
         _model_pool.put((model, _, device))
 
 
+@guard(_offload)
 def _encode_jina_text(texts: list[str]) -> Optional[np.ndarray]:
     """Encode a list of text strings with Jina CLIP v2. Returns (n, 1024) float32 array."""
     ensure_model_loaded()
@@ -566,6 +632,7 @@ def _sliding_text_windows(
     return out
 
 
+@guard(_offload)
 def _encode_omura_emmbed_text(texts: list[str]) -> Optional[np.ndarray]:
     ensure_model_loaded()
     model, processor, device = _model_pool.get()
@@ -611,6 +678,7 @@ def _encode_omura_emmbed_text(texts: list[str]) -> Optional[np.ndarray]:
         _model_pool.put((model, processor, device))
 
 
+@guard(_offload)
 def _encode_omura_emmbed_images(images: list[Image.Image]) -> Optional[np.ndarray]:
     ensure_model_loaded()
     model, processor, device = _model_pool.get()
@@ -654,6 +722,10 @@ def _encode_omura_emmbed_images(images: list[Image.Image]) -> Optional[np.ndarra
 
 def is_model_ready() -> bool:
     """Return True if at least one model instance is loaded."""
+    if _is_omuragemma_backend():
+        from omura.utils.omuragemma_embeddings import is_model_ready as _gemma_ready
+
+        return _gemma_ready()
     return _pool_size > 0
 
 
@@ -662,6 +734,11 @@ def generate_image_embedding(
     blob_id: str | None = None,
     instruction: str | None = None,
 ):
+    if _is_omuragemma_backend():
+        from omura.utils import omuragemma_embeddings as _gemma
+
+        return _gemma.generate_image_embedding(image_data, blob_id, instruction)
+
     from omura.parsers.multimodal import parse_image
 
     try:
@@ -702,6 +779,11 @@ def generate_image_embedding(
 
 
 def generate_video_embedding(video_data: bytes, ext: str, blob_id: str):
+    if _is_omuragemma_backend():
+        from omura.utils import omuragemma_embeddings as _gemma
+
+        return _gemma.generate_video_embedding(video_data, ext, blob_id)
+
     if _is_omura_emmbed_model():
         # Omura Embed is optimized for image+text retrieval in this pipeline.
         return None
@@ -738,6 +820,11 @@ def generate_video_embedding(video_data: bytes, ext: str, blob_id: str):
 
 
 def generate_audio_embedding(audio_data: bytes, ext: str, blob_id: str):
+    if _is_omuragemma_backend():
+        from omura.utils import omuragemma_embeddings as _gemma
+
+        return _gemma.generate_audio_embedding(audio_data, ext, blob_id)
+
     if _is_qwen3_vl_embedding_model():
         # Qwen3-VL embedding model does not support standalone audio inputs.
         return None
@@ -777,6 +864,13 @@ def generate_text_embedding(
     is_document: bool = False,
     instruction: str | None = None,
 ):
+    if _is_omuragemma_backend():
+        from omura.utils import omuragemma_embeddings as _gemma
+
+        return _gemma.generate_text_embedding(
+            text, is_document=is_document, instruction=instruction
+        )
+
     if not text:
         return None
     cleaned = text.strip()
@@ -1085,6 +1179,11 @@ def get_semantic_category_embeddings(categories: list[str]) -> list[np.ndarray]:
 
 def generate_multimodal_embedding(text: str, images: list = None):
     """Embed a document with text and optional PIL images (e.g. PDF pages)."""
+    if _is_omuragemma_backend():
+        from omura.utils import omuragemma_embeddings as _gemma
+
+        return _gemma.generate_multimodal_embedding(text, images)
+
     if _is_omura_emmbed_model():
         vectors = []
         if images:

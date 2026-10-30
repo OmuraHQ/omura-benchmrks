@@ -137,6 +137,51 @@ OMURA_EMBEDDING_MODEL="google/siglip2-so400m-patch14-384" .venv/bin/python bench
 
 ---
 
+## 6 · Image-to-Image retrieval under hard corruption — pure visual vs image+caption hybrid
+
+Harder i2i stress test for `immortaltatsu/omura_emebd`: queries are corrupted with 25% crop,
+50% resize, JPEG Q15, Gaussian blur σ=1.5, and color jitter 0.3. We compare pure-visual query
+embeddings against image+caption hybrid embeddings (caption weight 0.2).
+
+### 6a · MS COCO val2014 1K
+
+```bash
+.venv/bin/python benchmarks/benchmark_coco_i2i_hybrid.py \
+  --num-images 1000 \
+  --crop-frac 0.25 \
+  --resize-frac 0.50 \
+  --jpeg-quality 15 \
+  --blur-sigma 1.5 \
+  --color-jitter 0.3 \
+  --out-json benchmarks/results/coco_i2i_hybrid_hard_1000.json
+```
+
+Result (R@1): pure visual **88.5%** → image+caption hybrid **91.4%** (+2.9 pp).
+
+### 6b · NFT1000 ALIENFRENS 2K
+
+Requires the NFT1000 ALIENFRENS collection downloaded and unpacked under
+`data/nft1000/NFT1000/` (`img/`, `caption/`).
+
+```bash
+.venv/bin/python benchmarks/benchmark_nft1000_i2i_hybrid.py \
+  --img-dir data/nft1000/NFT1000/img \
+  --caption-dir data/nft1000/NFT1000/caption \
+  --num-samples 2000 \
+  --crop-frac 0.25 \
+  --resize-frac 0.50 \
+  --jpeg-quality 15 \
+  --blur-sigma 1.5 \
+  --color-jitter 0.3 \
+  --out-json benchmarks/results/nft1000_i2i_hybrid_hard_2000.json
+```
+
+Result (R@1): pure visual **83.5%** → image+caption hybrid **82.4%** (-1.1 pp). The generic
+NFT1000 generated captions do not help at weight 0.2; NFT provenance verification relies on the
+perceptual-hash duplicate confirmation path instead.
+
+---
+
 ## Notes on reproducibility
 
 - All scripts write a `--out`/`--results-out` JSON with the exact protocol

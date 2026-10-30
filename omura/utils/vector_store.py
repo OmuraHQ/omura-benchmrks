@@ -66,6 +66,21 @@ class VectorStore:
         """
         self.embedding_dim = int(embedding_dim) if embedding_dim else EMBEDDING_DIM
         self.backend = os.getenv("OMURA_VECTOR_BACKEND", "faiss").lower()
+
+        # Never load (or later overwrite) an index built by another embedding
+        # model. Applied only to the default/main store; modality stores pass an
+        # explicit index_path.
+        backend = os.getenv("OMURA_EMBEDDING_BACKEND", "").strip().lower()
+        if index_path is None and backend in {
+            "omuragemma",
+            "embeddinggemma",
+            "embeddinggemma2",
+            "embedding_gemma",
+            "gemma-embedding",
+        }:
+            from omura.utils.omuragemma_embeddings import verify_store_compatibility
+
+            verify_store_compatibility()
         
         # Validate backend availability
         if self.backend == "cuvs":
@@ -386,8 +401,11 @@ class VectorStore:
         if norm > 0:
             query_embedding = query_embedding / norm
 
-        # When filtering by kind, fetch more candidates then filter down
-        k = min(top_k * 10, count) if kind_filter else min(top_k, count)
+        # When filtering by kind, fetch a generous candidate pool then filter
+        # down. A ×10 pool starves rare modalities in a unified index (e.g. the
+        # top 50 may contain only one video when images dominate).
+        kind_overfetch = max(10, int(os.getenv("OMURA_KIND_OVERFETCH", "100")))
+        k = min(top_k * kind_overfetch, count) if kind_filter else min(top_k, count)
 
         indices_cpu = []
         distances_cpu = []
@@ -938,21 +956,66 @@ class VectorStore:
         """
         return self.embeddings_dict.get(blob_id)
 
+    def _catalog_expiry_fallback(self, blob_ids: List[str]) -> Dict[str, int]:
+        """Look up ``blobs.end_epoch`` for entries with no ``expiresAt`` metadata.
+
+        Older indexers wrote image metadata without an expiry, so every entry
+        was skipped by ``prune_expired`` and expired blobs accumulated forever.
+        """
+        found: Dict[str, int] = {}
+        chunk_size = 500
+        for start in range(0, len(blob_ids), chunk_size):
+            chunk = blob_ids[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            try:
+                with sqlite3.connect(str(self.catalog_db_path), timeout=30) as conn:
+                    rows = conn.execute(
+                        f"SELECT blob_id, end_epoch FROM blobs "
+                        f"WHERE blob_id IN ({placeholders}) "
+                        f"AND end_epoch IS NOT NULL",
+                        chunk,
+                    ).fetchall()
+                for blob_id, end_epoch in rows:
+                    try:
+                        found[blob_id] = int(end_epoch)
+                    except (TypeError, ValueError):
+                        continue
+            except Exception as exc:  # noqa: BLE001
+                print(f"[VectorStore] expiry fallback lookup failed: {exc}")
+                break
+        return found
+
     def prune_expired(self, current_epoch: int, dry_run: bool = False) -> Dict[str, int]:
         """Prune expired blobs from in-memory state and index.
 
-        A blob is expired when metadata has `expiresAt` and `expiresAt <= current_epoch`.
+        A blob is expired when metadata has ``expiresAt`` (or, failing that, the
+        catalog has ``end_epoch``) and the value is ``<= current_epoch``.
         """
         total_before = len(self.metadata)
-        expired_blob_ids: List[str] = []
 
+        # Fill gaps from the catalog so entries indexed before expiry metadata
+        # was written can still be pruned.
+        missing: List[str] = []
+        parsed: Dict[str, Dict] = {}
         for blob_id, raw_meta in self.metadata.items():
             try:
-                meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+                meta = json.loads(raw_meta) if isinstance(raw_meta, str) else dict(raw_meta)
             except (TypeError, json.JSONDecodeError):
                 meta = {}
+            parsed[blob_id] = meta
+            if meta.get("expiresAt") is None:
+                missing.append(blob_id)
+        fallback = self._catalog_expiry_fallback(missing) if missing else {}
 
-            expires_at = meta.get("expiresAt") if isinstance(meta, dict) else None
+        expired_blob_ids: List[str] = []
+        for blob_id, meta in parsed.items():
+            expires_at = meta.get("expiresAt")
+            if expires_at is None:
+                expires_at = fallback.get(blob_id)
+                if expires_at is not None and not dry_run:
+                    # Persist the recovered expiry for future runs.
+                    meta["expiresAt"] = expires_at
+                    self.metadata[blob_id] = json.dumps(meta)
             if expires_at is None:
                 continue
 

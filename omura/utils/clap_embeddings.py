@@ -21,6 +21,9 @@ import threading
 from typing import Optional
 
 import numpy as np
+import torch
+
+from omura.utils.gpu_offload import IdleOffloader, guard
 
 CLAP_MODEL = os.getenv("OMURA_CLAP_MODEL", "laion/larger_clap_general")
 CLAP_DIM = int(os.getenv("OMURA_CLAP_DIM", "512"))
@@ -32,6 +35,21 @@ _device = None
 _load_lock = threading.Lock()
 _load_failed = False
 _adapter_head = None
+
+
+def _unload_model() -> None:
+    """Drop CLAP weights so the idle reaper can reclaim GPU memory."""
+    global _model, _processor, _adapter_head
+
+    with _load_lock:
+        _model = None
+        _processor = None
+        _adapter_head = None
+    print("[CLAP] Released model on idle offload", flush=True)
+
+
+# 5 minutes of no audio/text inference -> free the GPU; reload lazily.
+_offload = IdleOffloader("clap", _unload_model)
 
 
 class ClapAdapterHead(torch.nn.Module):
@@ -84,6 +102,7 @@ def _ensure_loaded() -> bool:
             print(f"[CLAP] Loading {CLAP_MODEL} on {_device}…")
             model = ClapModel.from_pretrained(CLAP_MODEL)
             model.eval().to(_device)
+            model.float()  # guard against torch.set_default_dtype races with other concurrent model loads
             _processor = ClapProcessor.from_pretrained(CLAP_MODEL)
             _model = model
             print("[CLAP] Loaded.")
@@ -154,6 +173,7 @@ def _decode_audio(audio_data: bytes) -> Optional[np.ndarray]:
     return np.asarray(wav, dtype=np.float32)
 
 
+@guard(_offload)
 def embed_audio(audio_data: bytes, ext: str = "", blob_id: str = "") -> Optional[np.ndarray]:
     """Encode an audio clip into the CLAP joint space. Returns [512] or None."""
     if not _ensure_loaded():
@@ -183,6 +203,7 @@ def embed_audio(audio_data: bytes, ext: str = "", blob_id: str = "") -> Optional
         return None
 
 
+@guard(_offload)
 def embed_text(text: str) -> Optional[np.ndarray]:
     """Encode a text query into the CLAP joint space. Returns [512] or None."""
     if not _ensure_loaded():
